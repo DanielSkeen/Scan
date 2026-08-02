@@ -1,0 +1,10 @@
+# Sample weather station payloads for parser compatibility checks
+
+## Ambient Weather-style
+PASSKEY=734F2DDA57080BEE5D968901653F7821&stationtype=AMBWeatherPro_V5.2.2&dateutc=2026-08-02 01:51:39&tempf=92.3&humidity=34&windspeedmph=1.12&windgustmph=2.24&maxdailygust=10.29&winddir=138&uv=1&solarradiation=120.61&hourlyrainin=0.000&eventrainin=0.000&dailyrainin=0.000&weeklyrainin=0.000&monthlyrainin=0.000&yearlyrainin=8.220&totalrainin=18.039&battout=1&tempinf=85.6&humidityin=41&baromrelin=29.743&baromabsin=29.536
+
+## Generic / alternate naming
+station_type=DemoStation&temp=71.2&rh=45&windspeed=12.3&windgust=14.8&barometer=29.91&rainrate=0.12&event_rain=0.04&daily_rain=0.22&weekly_rain=0.55&monthly_rain=2.10&yearly_rain=11.20&uvindex=4&solar=850&indoortemp=68.5&indoorrh=36
+
+## Davis-like field names
+ID=station-01&stationType=Davis&tempF=70.2&humidityPct=44&windSpeed=8.5&gust=9.6&direction=225&barom=29.86&rainRate=0.09&rainDay=0.15&rainWeek=0.84&rainMonth=3.10&rainYear=12.55&UV=5&solarRad=910&tempIn=68.0&humIn=39

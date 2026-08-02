@@ -1,5 +1,5 @@
 CC = clang
-CFLAGS = -Wall -Wextra -O2 -Iinclude
+CFLAGS = -Wall -Wextra -O2 -Iinclude -pthread
 TARGET = scan
 SUMMARY_VIEWER = scan_summary_view
 UNAME_S := $(shell uname -s)
@@ -29,7 +29,7 @@ SDL_LIBS := $(shell pkg-config --libs sdl2 2>/dev/null)
 endif
 
 .PHONY: all clean test run release view-summary view-summary-pretty view-summary-dashboard doit
-.PHONY: receiver receiver-run push-example
+.PHONY: receiver receiver-run push-example sample-payloads
 
 all: $(TARGET) $(SUMMARY_VIEWER)
 
@@ -55,6 +55,11 @@ doit: view-summary-dashboard
 
 test: $(TARGET)
 	./tests/test_smoke.sh
+	$(CC) $(CFLAGS) -Iinclude -o tests/device_push_request_test tests/device_push_request_test.c src/device_push.c
+	./tests/device_push_request_test
+	$(CC) $(CFLAGS) -Iinclude -o tests/end_to_end_push_test tests/end_to_end_push_test.c src/device_push.c -lsqlite3
+	./tests/end_to_end_push_test
+	sh ./tests/test_demo_push.sh
 
 release: test
 	@if [ -z "$(VERSION)" ]; then \
@@ -90,6 +95,12 @@ receiver: src/ws_push_receiver.c
 
 push-example: examples/push_sender_example.c
 	$(CC) $(CFLAGS) -o push_sender_example examples/push_sender_example.c
+
+push-example-run: push-example
+	./push_sender_example 127.0.0.1 8089
+
+sample-payloads:
+	python3 tests/sample_payloads.py
 
 receiver-run: receiver
 	./ws_push_receiver

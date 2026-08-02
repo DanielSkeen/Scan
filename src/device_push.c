@@ -11,7 +11,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define REQUEST_BUF_SIZE 8192
+#define REQUEST_BUF_SIZE 16384
+#define REQUEST_READ_CHUNK 4096
 
 static int hex_value(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -108,18 +109,85 @@ static void send_success_response(int client_fd) {
 
 static int handle_client(DevicePushListener *listener, int client_fd, const struct sockaddr_in *client_addr) {
     char request[REQUEST_BUF_SIZE];
-    ssize_t n = recv(client_fd, request, sizeof(request) - 1, 0);
-    if (n <= 0) {
+    size_t total_received = 0;
+    int saw_header_end = 0;
+    int content_length = 0;
+    int body_bytes_needed = 0;
+    int is_form_payload = 0;
+
+    memset(request, 0, sizeof(request));
+
+    while (total_received < sizeof(request) - 1) {
+        ssize_t n = recv(client_fd, request + total_received, REQUEST_READ_CHUNK, 0);
+        if (n <= 0) {
+            break;
+        }
+
+        total_received += (size_t)n;
+        request[total_received] = '\0';
+
+        if (!saw_header_end) {
+            char *header_end = strstr(request, "\r\n\r\n");
+            if (header_end) {
+                saw_header_end = 1;
+                char *content_length_header = strstr(request, "Content-Length:");
+                if (content_length_header) {
+                    content_length_header += strlen("Content-Length:");
+                    while (*content_length_header == ' ' || *content_length_header == '\t') {
+                        ++content_length_header;
+                    }
+                    content_length = atoi(content_length_header);
+                    if (content_length < 0) {
+                        content_length = 0;
+                    }
+                }
+
+                if (strstr(request, "Content-Type: application/x-www-form-urlencoded") ||
+                    strstr(request, "Content-Type: text/plain") ||
+                    strstr(request, "Content-Type: application/json")) {
+                    is_form_payload = 1;
+                }
+                body_bytes_needed = content_length;
+                char *body_start = header_end + 4;
+                size_t body_len = total_received - (size_t)(body_start - request);
+                if (body_len >= (size_t)body_bytes_needed) {
+                    break;
+                }
+            }
+        } else if ((int)total_received >= (int)(strstr(request, "\r\n\r\n") - request) + 4 + body_bytes_needed) {
+            break;
+        }
+    }
+
+    if (total_received == 0) {
         send_success_response(client_fd);
         return 0;
     }
-    request[n] = '\0';
+
+    if (total_received >= sizeof(request) - 1) {
+        request[sizeof(request) - 1] = '\0';
+    }
 
     DevicePushMessage msg;
     memset(&msg, 0, sizeof(msg));
 
     char uri[1024] = {0};
     if (sscanf(request, "%7s %1023s", msg.method, uri) != 2) {
+        send_success_response(client_fd);
+        return 0;
+    }
+
+    if (strcmp(msg.method, "GET") != 0 && strcmp(msg.method, "POST") != 0) {
+        send_success_response(client_fd);
+        return 0;
+    }
+
+    if (body_bytes_needed > 0 && total_received < (size_t)(strstr(request, "\r\n\r\n") - request) + 4 + (size_t)body_bytes_needed) {
+        send_success_response(client_fd);
+        return 0;
+    }
+
+    if (body_bytes_needed == 0 && is_form_payload && strstr(request, "\r\n\r\n") == NULL) {
         send_success_response(client_fd);
         return 0;
     }
@@ -160,7 +228,7 @@ static int handle_client(DevicePushListener *listener, int client_fd, const stru
         snprintf(msg.path, sizeof(msg.path), "%s", uri);
     }
 
-    if (body && body[0] != '\0') {
+    if (body && body[0] != '\0' && is_form_payload) {
         msg.field_count = append_parsed_fields(body, msg.fields, msg.field_count, DEVICE_PUSH_MAX_FIELDS);
     }
 

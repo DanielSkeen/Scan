@@ -1,11 +1,16 @@
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 #include <sqlite3.h>
 #include <SDL.h>
 #ifdef SCAN_HAS_SDL_TTF
@@ -31,6 +36,164 @@
 #define PUSH_DB_EXPORT_PATH "weather_packets.csv"
 #define EXIT_DB_PREVIEW_ROWS 10
 #define EXIT_DB_SUMMARY_PATH "scan_exit_db_summary.txt"
+#define SINGLE_INSTANCE_LOCK_PATH "/tmp/scan.lock"
+
+typedef struct {
+    int listener_port;
+    char db_path[512];
+    int has_port_override;
+    int has_db_override;
+    int ui_mode;
+    int scan_mode;
+    int info_mode;
+    int demo_push_mode;
+    int export_csv_mode;
+    const char *export_csv_path;
+    int show_help;
+} AppConfig;
+
+static void app_config_init(AppConfig *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->listener_port = PUSH_LISTENER_PORT;
+    snprintf(cfg->db_path, sizeof(cfg->db_path), "%s", PUSH_DB_PATH);
+    cfg->export_csv_path = PUSH_DB_EXPORT_PATH;
+}
+
+static int parse_app_config(int argc, char **argv, AppConfig *cfg) {
+    app_config_init(cfg);
+
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "--ui") == 0) {
+            cfg->ui_mode = 1;
+        } else if (strcmp(arg, "--scan") == 0) {
+            cfg->scan_mode = 1;
+        } else if (strcmp(arg, "--info") == 0) {
+            cfg->info_mode = 1;
+        } else if (strcmp(arg, "--demo-push") == 0) {
+            cfg->demo_push_mode = 1;
+        } else if (strcmp(arg, "--export-csv") == 0) {
+            cfg->export_csv_mode = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                cfg->export_csv_path = argv[++i];
+            }
+        } else if (strcmp(arg, "--port") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                fprintf(stderr, "missing value for --port\n");
+                return -1;
+            }
+            cfg->listener_port = atoi(argv[++i]);
+            cfg->has_port_override = 1;
+        } else if (strcmp(arg, "--db") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                fprintf(stderr, "missing value for --db\n");
+                return -1;
+            }
+            snprintf(cfg->db_path, sizeof(cfg->db_path), "%s", argv[++i]);
+            cfg->has_db_override = 1;
+        } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+            cfg->show_help = 1;
+        } else if (arg[0] == '-') {
+            fprintf(stderr, "unknown option: %s\n", arg);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static void print_usage(const char *prog) {
+    printf("Usage: %s [--ui] [--scan] [--info] [--demo-push] [--export-csv [file]] [--port N] [--db PATH]\n", prog);
+    puts("  --ui             launch the SDL windowed UI");
+    puts("  --scan           run the network scan once");
+    puts("  --info           show app info");
+    puts("  --demo-push     send a demo weather push");
+    puts("  --export-csv    export stored packets to CSV");
+    puts("  --port N         override the listener port");
+    puts("  --db PATH        override the SQLite database path");
+}
+
+static int scan_ui_instance_running(int exclude_pid) {
+    FILE *ps = popen("ps -axo pid=,command=", "r");
+    if (!ps) {
+        return -1;
+    }
+
+    char line[1024];
+    int found = 0;
+    while (fgets(line, sizeof(line), ps)) {
+        int pid = 0;
+        if (sscanf(line, "%d", &pid) != 1) {
+            continue;
+        }
+        if (pid == exclude_pid) {
+            continue;
+        }
+        if (strstr(line, "scan") && strstr(line, "--ui")) {
+            found = 1;
+            break;
+        }
+    }
+
+    int status = pclose(ps);
+    if (status != 0 && !found) {
+        return -1;
+    }
+    return found;
+}
+
+static int acquire_single_instance_lock(const char *lock_path, int *lock_fd) {
+    *lock_fd = open(lock_path, O_RDWR | O_CREAT, 0600);
+    if (*lock_fd < 0) {
+        fprintf(stderr, "[scan-ui] failed to open lock file %s: %s\n", lock_path, strerror(errno));
+        return -1;
+    }
+
+    struct flock lock;
+    memset(&lock, 0, sizeof(lock));
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = 0;
+    lock.l_len = 0;
+
+    if (fcntl(*lock_fd, F_SETLK, &lock) == -1) {
+        if (errno == EACCES || errno == EAGAIN) {
+            fprintf(stderr, "[scan-ui] another instance is already running; refusing to start a duplicate.\n");
+            close(*lock_fd);
+            *lock_fd = -1;
+            return 1;
+        }
+
+        fprintf(stderr, "[scan-ui] failed to lock %s: %s\n", lock_path, strerror(errno));
+        close(*lock_fd);
+        *lock_fd = -1;
+        return -1;
+    }
+
+    if (ftruncate(*lock_fd, 0) == 0) {
+        char pid_buf[32];
+        int pid_len = snprintf(pid_buf, sizeof(pid_buf), "%d\n", getpid());
+        if (pid_len > 0) {
+            (void)write(*lock_fd, pid_buf, (size_t)pid_len);
+        }
+    }
+
+    return 0;
+}
+
+static void release_single_instance_lock(int lock_fd, const char *lock_path) {
+    if (lock_fd >= 0) {
+        struct flock lock;
+        memset(&lock, 0, sizeof(lock));
+        lock.l_type = F_UNLCK;
+        lock.l_whence = SEEK_SET;
+        lock.l_start = 0;
+        lock.l_len = 0;
+        (void)fcntl(lock_fd, F_SETLK, &lock);
+        close(lock_fd);
+    }
+    (void)unlink(lock_path);
+}
 
 static int run_info_mode(void) {
     puts(scan_banner());
@@ -63,10 +226,44 @@ static int append_line(char lines[][UI_LINE_LEN], int max_lines, int count, cons
     return count + 1;
 }
 
+typedef struct {
+    pthread_t thread;
+    int active;
+    int done;
+    int scan_ok;
+    char scan_err[256];
+    ScanResult result;
+} UiScanState;
+
+static void *ui_scan_worker(void *arg) {
+    UiScanState *state = (UiScanState *)arg;
+    state->scan_ok = (wifi_scan_collect(&state->result, state->scan_err, sizeof(state->scan_err)) == 0);
+    state->done = 1;
+    return NULL;
+}
+
+static void start_ui_scan_worker(UiScanState *state) {
+    if (!state || state->active) {
+        return;
+    }
+
+    memset(state, 0, sizeof(*state));
+    if (pthread_create(&state->thread, NULL, ui_scan_worker, state) != 0) {
+        state->active = 0;
+        state->done = 1;
+        state->scan_ok = 0;
+        snprintf(state->scan_err, sizeof(state->scan_err), "scan worker failed to start");
+        return;
+    }
+
+    state->active = 1;
+}
+
 static int build_ui_lines(
     const ScanResult *result,
     int scan_ok,
     const char *scan_err,
+    int scan_in_progress,
     char lines[][UI_LINE_LEN],
     int max_lines
 ) {
@@ -76,6 +273,11 @@ static int build_ui_lines(
     count = append_line(lines, max_lines, count, "");
 
     if (!scan_ok) {
+        if (scan_in_progress) {
+            count = append_line(lines, max_lines, count, "Network scan warming up in background...");
+            count = append_line(lines, max_lines, count, "Weather receiver is already live; results will appear shortly.");
+            return count;
+        }
         count = append_line(lines, max_lines, count, "Scan unavailable: %s", scan_err && scan_err[0] ? scan_err : "unknown error");
         return count;
     }
@@ -230,6 +432,7 @@ typedef struct {
     int recent_packet_count;
     char lines[UI_TRAFFIC_MAX_LINES][UI_LINE_LEN];
     int line_count;
+    int listener_port;
 } PushIngestState;
 
 static int point_in_rect(int x, int y, const SDL_Rect *r) {
@@ -598,12 +801,13 @@ static void csv_write_escaped(FILE *f, const char *text) {
     fputc('"', f);
 }
 
-static int run_export_csv_mode(const char *csv_path) {
+static int run_export_csv_mode(const AppConfig *cfg, const char *csv_path) {
     sqlite3 *db = NULL;
     sqlite3_stmt *stmt = NULL;
+    const char *db_path = cfg && cfg->db_path[0] ? cfg->db_path : PUSH_DB_PATH;
 
-    if (sqlite3_open(PUSH_DB_PATH, &db) != SQLITE_OK) {
-        fprintf(stderr, "Failed to open %s: %s\n", PUSH_DB_PATH, sqlite3_errmsg(db));
+    if (sqlite3_open(db_path, &db) != SQLITE_OK) {
+        fprintf(stderr, "Failed to open %s: %s\n", db_path, sqlite3_errmsg(db));
         if (db) {
             sqlite3_close(db);
         }
@@ -806,31 +1010,51 @@ static int bind_text_or_null(sqlite3_stmt *stmt, int idx, const char *val) {
     return sqlite3_bind_null(stmt, idx);
 }
 
+static const char *pick_field_value(const DevicePushMessage *msg, const char *primary, const char *secondary, const char *tertiary) {
+    const char *value = push_field_value(msg, primary);
+    if (value && value[0]) {
+        return value;
+    }
+    if (secondary) {
+        value = push_field_value(msg, secondary);
+        if (value && value[0]) {
+            return value;
+        }
+    }
+    if (tertiary) {
+        value = push_field_value(msg, tertiary);
+        if (value && value[0]) {
+            return value;
+        }
+    }
+    return NULL;
+}
+
 static int push_storage_insert(PushStorage *storage, const DevicePushMessage *msg) {
     if (!storage || !storage->db || !storage->insert_stmt || !msg) {
         return 0;
     }
 
-    const char *station_id = push_field_value(msg, "ID");
-    const char *station_type = push_field_value(msg, "stationtype");
-    const char *tempf = push_field_value(msg, "tempf");
-    const char *humidity = push_field_value(msg, "humidity");
-    const char *windspeedmph = push_field_value(msg, "windspeedmph");
-    const char *windgustmph = push_field_value(msg, "windgustmph");
-    const char *winddir = push_field_value(msg, "winddir");
-    const char *baromrelin = push_field_value(msg, "baromrelin");
-    const char *baromabsin = push_field_value(msg, "baromabsin");
-    const char *rainratein = push_field_value(msg, "rainratein");
-    const char *eventrainin = push_field_value(msg, "eventrainin");
-    const char *hourlyrainin = push_field_value(msg, "hourlyrainin");
-    const char *dailyrainin = push_field_value(msg, "dailyrainin");
-    const char *weeklyrainin = push_field_value(msg, "weeklyrainin");
-    const char *monthlyrainin = push_field_value(msg, "monthlyrainin");
-    const char *yearlyrainin = push_field_value(msg, "yearlyrainin");
-    const char *uv = push_field_value(msg, "uv");
-    const char *solarradiation = push_field_value(msg, "solarradiation");
-    const char *indoortempf = push_field_value(msg, "indoortempf");
-    const char *indoorhumidity = push_field_value(msg, "indoorhumidity");
+    const char *station_id = pick_field_value(msg, "ID", "id", "stationid");
+    const char *station_type = pick_field_value(msg, "stationtype", "station_type", "stationType");
+    const char *tempf = pick_field_value(msg, "tempf", "temp", "temp_f");
+    const char *humidity = pick_field_value(msg, "humidity", "rh", "humidity_pct");
+    const char *windspeedmph = pick_field_value(msg, "windspeedmph", "windspeed", "windspeedmph");
+    const char *windgustmph = pick_field_value(msg, "windgustmph", "windgust", "gustmph");
+    const char *winddir = pick_field_value(msg, "winddir", "wind_direction", "direction");
+    const char *baromrelin = pick_field_value(msg, "baromrelin", "barometer", "baromin");
+    const char *baromabsin = pick_field_value(msg, "baromabsin", "baromabs", "baromabsin");
+    const char *rainratein = pick_field_value(msg, "rainratein", "rainrate", "rain_rate");
+    const char *eventrainin = pick_field_value(msg, "eventrainin", "eventrain", "event_rain");
+    const char *hourlyrainin = pick_field_value(msg, "hourlyrainin", "hourlyrain", "hourly_rain");
+    const char *dailyrainin = pick_field_value(msg, "dailyrainin", "dailyrain", "daily_rain");
+    const char *weeklyrainin = pick_field_value(msg, "weeklyrainin", "weeklyrain", "weekly_rain");
+    const char *monthlyrainin = pick_field_value(msg, "monthlyrainin", "monthlyrain", "monthly_rain");
+    const char *yearlyrainin = pick_field_value(msg, "yearlyrainin", "yearlyrain", "yearly_rain");
+    const char *uv = pick_field_value(msg, "uv", "solaruv", "uvindex");
+    const char *solarradiation = pick_field_value(msg, "solarradiation", "solar", "solarrad");
+    const char *indoortempf = pick_field_value(msg, "indoortempf", "tempinf", "indoortemp");
+    const char *indoorhumidity = pick_field_value(msg, "indoorhumidity", "humidityin", "indoorrh");
 
     char raw_fields[4096];
     push_storage_build_raw_fields(msg, raw_fields, sizeof(raw_fields));
@@ -898,26 +1122,26 @@ static int weather_push_parser(const DevicePushMessage *msg, void *user_data) {
         state->recent_packet_count = refreshed;
     }
 
-    const char *stationtype = push_field_value(msg, "stationtype");
-    const char *tempf = push_field_value(msg, "tempf");
-    const char *humidity = push_field_value(msg, "humidity");
-    const char *windspeedmph = push_field_value(msg, "windspeedmph");
-    const char *windgustmph = push_field_value(msg, "windgustmph");
-    const char *winddir = push_field_value(msg, "winddir");
-    const char *baromrelin = push_field_value(msg, "baromrelin");
-    const char *baromabsin = push_field_value(msg, "baromabsin");
-    const char *rainin = push_field_value(msg, "rainin");
-    const char *rainratein = push_field_value(msg, "rainratein");
-    const char *eventrainin = push_field_value(msg, "eventrainin");
-    const char *hourlyrainin = push_field_value(msg, "hourlyrainin");
-    const char *dailyrainin = push_field_value(msg, "dailyrainin");
-    const char *weeklyrainin = push_field_value(msg, "weeklyrainin");
-    const char *monthlyrainin = push_field_value(msg, "monthlyrainin");
-    const char *yearlyrainin = push_field_value(msg, "yearlyrainin");
-    const char *uv = push_field_value(msg, "uv");
-    const char *solarradiation = push_field_value(msg, "solarradiation");
-    const char *indoortempf = push_field_value(msg, "indoortempf");
-    const char *indoorhumidity = push_field_value(msg, "indoorhumidity");
+    const char *stationtype = pick_field_value(msg, "stationtype", "station_type", "stationType");
+    const char *tempf = pick_field_value(msg, "tempf", "temp", "temp_f");
+    const char *humidity = pick_field_value(msg, "humidity", "rh", "humidity_pct");
+    const char *windspeedmph = pick_field_value(msg, "windspeedmph", "windspeed", "windspeedmph");
+    const char *windgustmph = pick_field_value(msg, "windgustmph", "windgust", "gustmph");
+    const char *winddir = pick_field_value(msg, "winddir", "wind_direction", "direction");
+    const char *baromrelin = pick_field_value(msg, "baromrelin", "barometer", "baromin");
+    const char *baromabsin = pick_field_value(msg, "baromabsin", "baromabs", "baromabsin");
+    const char *rainin = pick_field_value(msg, "rainin", "totalrainin", "rain_total");
+    const char *rainratein = pick_field_value(msg, "rainratein", "rainrate", "rain_rate");
+    const char *eventrainin = pick_field_value(msg, "eventrainin", "eventrain", "event_rain");
+    const char *hourlyrainin = pick_field_value(msg, "hourlyrainin", "hourlyrain", "hourly_rain");
+    const char *dailyrainin = pick_field_value(msg, "dailyrainin", "dailyrain", "daily_rain");
+    const char *weeklyrainin = pick_field_value(msg, "weeklyrainin", "weeklyrain", "weekly_rain");
+    const char *monthlyrainin = pick_field_value(msg, "monthlyrainin", "monthlyrain", "monthly_rain");
+    const char *yearlyrainin = pick_field_value(msg, "yearlyrainin", "yearlyrain", "yearly_rain");
+    const char *uv = pick_field_value(msg, "uv", "solaruv", "uvindex");
+    const char *solarradiation = pick_field_value(msg, "solarradiation", "solar", "solarrad");
+    const char *indoortempf = pick_field_value(msg, "indoortempf", "tempinf", "indoortemp");
+    const char *indoorhumidity = pick_field_value(msg, "indoorhumidity", "humidityin", "indoorrh");
 
     copy_if_present(weather->station_type, sizeof(weather->station_type), stationtype);
     copy_if_present(weather->tempf, sizeof(weather->tempf), tempf);
@@ -988,7 +1212,7 @@ static int weather_push_parser(const DevicePushMessage *msg, void *user_data) {
     return 0;
 }
 
-static void push_ingest_reset(PushIngestState *state, const char *weather_ip) {
+static void push_ingest_reset(PushIngestState *state, const char *weather_ip, int listener_port) {
     device_push_listener_stop(&state->listener);
     memset(&state->weather, 0, sizeof(state->weather));
     state->line_count = 0;
@@ -1000,6 +1224,7 @@ static void push_ingest_reset(PushIngestState *state, const char *weather_ip) {
         snprintf(state->weather.weather_ip, sizeof(state->weather.weather_ip), "%s", weather_ip);
     }
     state->recent_packet_count = 0;
+    state->listener_port = listener_port;
     ingest_append_line(state, "Weather push listener");
     if (state->storage.db) {
         char storage_line[UI_LINE_LEN];
@@ -1013,25 +1238,25 @@ static void push_ingest_reset(PushIngestState *state, const char *weather_ip) {
         }
     }
 
-    if (device_push_listener_start(&state->listener, PUSH_LISTENER_PORT, weather_push_parser, state) != 0) {
+    if (device_push_listener_start(&state->listener, listener_port, weather_push_parser, state) != 0) {
         char line[UI_LINE_LEN];
-        snprintf(line, sizeof(line), "Failed to bind listener on %d: %s", PUSH_LISTENER_PORT, state->listener.last_error);
+        snprintf(line, sizeof(line), "Failed to bind listener on %d: %s", listener_port, state->listener.last_error);
         ingest_append_line(state, line);
         fprintf(stderr, "[scan-ui] push-listener start failed: %s\n", state->listener.last_error);
         return;
     }
 
-    fprintf(stderr, "[scan-ui] push-listener started on port %d\n", PUSH_LISTENER_PORT);
+    fprintf(stderr, "[scan-ui] push-listener started on port %d\n", listener_port);
 
     char line[UI_LINE_LEN];
-    snprintf(line, sizeof(line), "Listening on 0.0.0.0:%d for station pushes", PUSH_LISTENER_PORT);
+    snprintf(line, sizeof(line), "Listening on 0.0.0.0:%d for station pushes", listener_port);
     ingest_append_line(state, line);
     snprintf(
         line,
         sizeof(line),
         "Configure WS-2902 custom upload to %s:%d",
         state->weather.weather_ip[0] ? state->weather.weather_ip : "<your-mac-ip>",
-        PUSH_LISTENER_PORT
+        listener_port
     );
     ingest_append_line(state, line);
 }
@@ -1065,7 +1290,199 @@ static void push_ingest_stop(PushIngestState *state) {
     push_storage_close(&state->storage);
 }
 
+static int build_weather_detail_lines(const PushIngestState *state, char lines[][UI_LINE_LEN], int max_lines) {
+    int count = 0;
+
+    count = append_line(lines, max_lines, count, "Weather Station Data");
+    count = append_line(lines, max_lines, count, "Live values from incoming station pushes");
+    count = append_line(lines, max_lines, count, "IP: %s", state->weather.weather_ip[0] ? state->weather.weather_ip : "n/a");
+    count = append_line(lines, max_lines, count, "Station: %s", state->weather.station_type[0] ? state->weather.station_type : "n/a");
+    count = append_line(lines, max_lines, count, "Temp: %s°F | RH: %s%% | Wind: %s mph",
+        state->weather.tempf[0] ? state->weather.tempf : "n/a",
+        state->weather.humidity[0] ? state->weather.humidity : "n/a",
+        state->weather.windspeedmph[0] ? state->weather.windspeedmph : "n/a");
+    count = append_line(lines, max_lines, count, "Gust: %s mph | Dir: %s°",
+        state->weather.windgustmph[0] ? state->weather.windgustmph : "n/a",
+        state->weather.winddir[0] ? state->weather.winddir : "n/a");
+    count = append_line(lines, max_lines, count, "Barom rel/abs: %s / %s inHg",
+        state->weather.baromrelin[0] ? state->weather.baromrelin : "n/a",
+        state->weather.baromabsin[0] ? state->weather.baromabsin : "n/a");
+    count = append_line(lines, max_lines, count, "Rain rate/event/day: %s / %s / %s in",
+        state->weather.rainratein[0] ? state->weather.rainratein : "n/a",
+        state->weather.eventrainin[0] ? state->weather.eventrainin : "n/a",
+        state->weather.dailyrainin[0] ? state->weather.dailyrainin : "n/a");
+    count = append_line(lines, max_lines, count, "UV: %s | Solar: %s W/m²",
+        state->weather.uv[0] ? state->weather.uv : "n/a",
+        state->weather.solarradiation[0] ? state->weather.solarradiation : "n/a");
+    count = append_line(lines, max_lines, count, "Indoor: %s°F / %s%%",
+        state->weather.indoortempf[0] ? state->weather.indoortempf : "n/a",
+        state->weather.indoorhumidity[0] ? state->weather.indoorhumidity : "n/a");
+
+    if (state->weather.last_update > 0) {
+        char ts[32] = "";
+        struct tm tm_snapshot;
+        localtime_r(&state->weather.last_update, &tm_snapshot);
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_snapshot);
+        count = append_line(lines, max_lines, count, "Last push: %s", ts);
+    }
+
+    count = append_line(lines, max_lines, count, "Recent packets from DB:");
+    if (state->recent_packet_count <= 0) {
+        count = append_line(lines, max_lines, count, "- none yet");
+    } else {
+        int packet_limit = state->recent_packet_count;
+        if (packet_limit > 6) {
+            packet_limit = 6;
+        }
+        for (int i = 0; i < packet_limit; ++i) {
+            count = append_line(lines, max_lines, count, "- %s", state->recent_packets[i]);
+        }
+    }
+
+    return count;
+}
+
+static void render_weather_detail_window(
+    SDL_Renderer *renderer,
+    TTF_Font *font,
+    const PushIngestState *state
+) {
+    int win_w = 0;
+    int win_h = 0;
+    SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
+
+    SDL_Color bg = {8, 18, 30, 255};
+    SDL_Color panel = {18, 28, 44, 255};
+    SDL_Color accent = {124, 183, 255, 255};
+    SDL_Color text = {230, 239, 255, 255};
+    SDL_Color muted = {175, 187, 205, 255};
+
+    SDL_SetRenderDrawColor(renderer, bg.r, bg.g, bg.b, bg.a);
+    SDL_RenderClear(renderer);
+
+    SDL_Rect outer = {8, 8, win_w - 16, win_h - 16};
+    SDL_SetRenderDrawColor(renderer, panel.r, panel.g, panel.b, panel.a);
+    SDL_RenderFillRect(renderer, &outer);
+    SDL_SetRenderDrawColor(renderer, accent.r, accent.g, accent.b, accent.a);
+    SDL_RenderDrawRect(renderer, &outer);
+
+    SDL_Rect title_bar = {16, 16, win_w - 32, 34};
+    SDL_SetRenderDrawColor(renderer, 28, 42, 64, 255);
+    SDL_RenderFillRect(renderer, &title_bar);
+
+#ifdef SCAN_HAS_SDL_TTF
+    if (font) {
+        int line_h = UI_FONT_SIZE + 4;
+        int y = 58;
+        draw_text_line(renderer, font, 24, y, "Weather Station Data", accent);
+        y += line_h;
+        draw_text_line(renderer, font, 24, y, "Live values from incoming station pushes", muted);
+        y += line_h + 6;
+
+        char lines[256][UI_LINE_LEN];
+        int line_count = build_weather_detail_lines(state, lines, 256);
+        int visible_lines = (win_h - 88) / line_h;
+        if (visible_lines < 1) {
+            visible_lines = 1;
+        }
+        for (int i = 0; i < line_count && i < visible_lines; ++i) {
+            draw_text_line(renderer, font, 24, y, lines[i], text);
+            y += line_h;
+        }
+    }
+#else
+    (void)font;
+    (void)state;
+#endif
+}
+
 static int draw_weather_summary(
+    SDL_Renderer *renderer,
+    TTF_Font *font,
+    const SDL_Rect *traffic_panel,
+    const PushIngestState *state,
+    SDL_Color color,
+    int line_h
+) {
+    char line[UI_LINE_LEN];
+    int y = traffic_panel->y + 10;
+    int lines_used = 0;
+
+    SDL_Color banner_color = {123, 209, 255, 255};
+    SDL_Color accent = {255, 212, 123, 255};
+
+    snprintf(line, sizeof(line), "LIVE WEATHER  packets=%d", state->weather.messages_received);
+    draw_text_line(renderer, font, traffic_panel->x + 10, y, line, banner_color);
+    y += line_h;
+    lines_used++;
+
+    if (state->weather.last_update > 0) {
+        char ts[32] = "";
+        struct tm tm_snapshot;
+        localtime_r(&state->weather.last_update, &tm_snapshot);
+        strftime(ts, sizeof(ts), "%H:%M:%S", &tm_snapshot);
+        snprintf(line, sizeof(line), "Last update: %s  Station: %s", ts, state->weather.station_type[0] ? state->weather.station_type : "n/a");
+        draw_text_line(renderer, font, traffic_panel->x + 10, y, line, accent);
+        y += line_h;
+        lines_used++;
+    } else {
+        draw_text_line(renderer, font, traffic_panel->x + 10, y, "Last update: waiting for first packet", accent);
+        y += line_h;
+        lines_used++;
+    }
+
+    snprintf(line, sizeof(line), "T=%s°F | RH=%s%% | Wind=%s mph | Gust=%s mph",
+        state->weather.tempf[0] ? state->weather.tempf : "n/a",
+        state->weather.humidity[0] ? state->weather.humidity : "n/a",
+        state->weather.windspeedmph[0] ? state->weather.windspeedmph : "n/a",
+        state->weather.windgustmph[0] ? state->weather.windgustmph : "n/a");
+    draw_text_line(renderer, font, traffic_panel->x + 10, y, line, color);
+    y += line_h;
+    lines_used++;
+
+    snprintf(line, sizeof(line), "Barom=%s / %s inHg | Rain=%s / %s in",
+        state->weather.baromrelin[0] ? state->weather.baromrelin : "n/a",
+        state->weather.baromabsin[0] ? state->weather.baromabsin : "n/a",
+        state->weather.rainratein[0] ? state->weather.rainratein : "n/a",
+        state->weather.dailyrainin[0] ? state->weather.dailyrainin : "n/a");
+    draw_text_line(renderer, font, traffic_panel->x + 10, y, line, color);
+    y += line_h;
+    lines_used++;
+
+    snprintf(line, sizeof(line), "UV=%s | Solar=%s W/m² | Indoor=%s°F/%s%%",
+        state->weather.uv[0] ? state->weather.uv : "n/a",
+        state->weather.solarradiation[0] ? state->weather.solarradiation : "n/a",
+        state->weather.indoortempf[0] ? state->weather.indoortempf : "n/a",
+        state->weather.indoorhumidity[0] ? state->weather.indoorhumidity : "n/a");
+    draw_text_line(renderer, font, traffic_panel->x + 10, y, line, color);
+    y += line_h;
+    lines_used++;
+
+    draw_text_line(renderer, font, traffic_panel->x + 10, y, "Recent packets:", color);
+    y += line_h;
+    lines_used++;
+
+    int packet_limit = state->recent_packet_count;
+    if (packet_limit > 3) {
+        packet_limit = 3;
+    }
+    if (packet_limit <= 0) {
+        draw_text_line(renderer, font, traffic_panel->x + 10, y, "- none yet", color);
+        y += line_h;
+        lines_used++;
+    } else {
+        for (int i = 0; i < packet_limit; ++i) {
+            snprintf(line, sizeof(line), "- %s", state->recent_packets[i]);
+            draw_text_line(renderer, font, traffic_panel->x + 10, y, line, color);
+            y += line_h;
+            lines_used++;
+        }
+    }
+
+    return lines_used;
+}
+
+static int draw_weather_detail_panel(
     SDL_Renderer *renderer,
     TTF_Font *font,
     const SDL_Rect *traffic_panel,
@@ -1306,10 +1723,156 @@ static const char *window_event_name(Uint8 ev) {
     }
 }
 
-static int run_ui_mode(void) {
+static int find_available_listener_port(int preferred_port, int *selected_port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    int yes = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)preferred_port);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        if (errno != EADDRINUSE && errno != EADDRNOTAVAIL) {
+            close(fd);
+            return -1;
+        }
+        addr.sin_port = 0;
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *)&addr, &addr_len) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    *selected_port = ntohs(addr.sin_port);
+    close(fd);
+    return 0;
+}
+
+static int send_demo_push_payload(const char *host, int port, const char *payload) {
+    int sock = -1;
+    struct sockaddr_in addr;
+    char request[4096];
+    int request_len;
+    int rc = -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+        fprintf(stderr, "invalid demo host: %s\n", host);
+        return -1;
+    }
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("connect");
+        close(sock);
+        return -1;
+    }
+
+    request_len = snprintf(
+        request,
+        sizeof(request),
+        "GET /weatherstation/updateweatherstation.php?%s HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        payload
+    );
+    if (request_len < 0 || (size_t)request_len >= sizeof(request)) {
+        fprintf(stderr, "demo request too large\n");
+        close(sock);
+        return -1;
+    }
+
+    if (send(sock, request, (size_t)request_len, 0) < 0) {
+        perror("send");
+        close(sock);
+        return -1;
+    }
+
+    close(sock);
+    return 0;
+}
+
+static int run_demo_push_mode(const AppConfig *cfg) {
+    PushIngestState ingest;
+    int handled = 0;
+    int attempts = 0;
+    const char *payload = "stationtype=AMBWeatherPro_V5.2.2&tempf=92.3&humidity=34&windspeedmph=1.12&windgustmph=2.24";
+    const char *db_path = cfg && cfg->db_path[0] ? cfg->db_path : PUSH_DB_PATH;
+    int listener_port = cfg ? cfg->listener_port : PUSH_LISTENER_PORT;
+
+    memset(&ingest, 0, sizeof(ingest));
+    ingest.storage_error_reported = 0;
+
+    if (push_storage_init(&ingest.storage, db_path) != 0) {
+        fprintf(stderr, "[scan-ui] sqlite init failed for %s: %s\n", db_path, ingest.storage.last_error[0] ? ingest.storage.last_error : "unknown");
+        return 1;
+    }
+
+    if (find_available_listener_port(listener_port, &listener_port) != 0) {
+        fprintf(stderr, "[scan-ui] failed to find a free demo listener port, using %d\n", listener_port);
+        push_ingest_stop(&ingest);
+        return 1;
+    }
+
+    push_ingest_reset(&ingest, "127.0.0.1", listener_port);
+
+    if (send_demo_push_payload("127.0.0.1", listener_port, payload) != 0) {
+        fprintf(stderr, "[scan-ui] failed to send demo payload\n");
+        push_ingest_stop(&ingest);
+        return 1;
+    }
+
+    while (attempts < 50) {
+        if (device_push_listener_poll(&ingest.listener, 1, &handled) != 0) {
+            fprintf(stderr, "[scan-ui] demo listener poll failed: %s\n", ingest.listener.last_error);
+            push_ingest_stop(&ingest);
+            return 1;
+        }
+        if (handled > 0) {
+            break;
+        }
+        usleep(100000);
+        attempts++;
+    }
+
+    push_ingest_stop(&ingest);
+    if (handled > 0) {
+        puts("demo push delivered");
+        return 0;
+    }
+    fprintf(stderr, "[scan-ui] demo push was not handled\n");
+    return 1;
+}
+
+static int run_ui_mode(const AppConfig *cfg) {
     ScanResult result;
     char scan_err[256] = {0};
-    int scan_ok = (wifi_scan_collect(&result, scan_err, sizeof(scan_err)) == 0);
+    int scan_ok = 0;
+    int scan_in_progress = 1;
+    UiScanState scan_state;
+    memset(&result, 0, sizeof(result));
+    memset(&scan_state, 0, sizeof(scan_state));
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -1341,6 +1904,27 @@ static int run_ui_mode(void) {
         return 1;
     }
 
+    SDL_Window *weather_window = SDL_CreateWindow(
+        "Weather Station Data",
+        SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED,
+        900,
+        700,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
+    );
+    SDL_Renderer *weather_renderer = NULL;
+    if (weather_window) {
+        weather_renderer = SDL_CreateRenderer(weather_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        if (!weather_renderer) {
+            weather_renderer = SDL_CreateRenderer(weather_window, -1, SDL_RENDERER_ACCELERATED);
+        }
+        if (!weather_renderer) {
+            fprintf(stderr, "SDL_CreateRenderer for weather window failed: %s\n", SDL_GetError());
+            SDL_DestroyWindow(weather_window);
+            weather_window = NULL;
+        }
+    }
+
 #ifdef SCAN_HAS_SDL_TTF
     if (TTF_Init() != 0) {
         fprintf(stderr, "TTF_Init failed: %s\n", TTF_GetError());
@@ -1364,20 +1948,28 @@ static int run_ui_mode(void) {
     ScanAppState app;
     scan_app_init(&app);
 
+    start_ui_scan_worker(&scan_state);
+
     Uint64 prev_ticks = SDL_GetPerformanceCounter();
     char lines[UI_MAX_LINES][UI_LINE_LEN];
-    int line_count = build_ui_lines(&result, scan_ok, scan_err, lines, UI_MAX_LINES);
+    int line_count = build_ui_lines(&result, scan_ok, scan_err, scan_in_progress, lines, UI_MAX_LINES);
     int scroll_offset = 0;
+    const char *db_path = cfg && cfg->db_path[0] ? cfg->db_path : PUSH_DB_PATH;
+    int listener_port = cfg ? cfg->listener_port : PUSH_LISTENER_PORT;
     PushIngestState ingest;
     memset(&ingest, 0, sizeof(ingest));
     ingest.storage_error_reported = 0;
-    if (push_storage_init(&ingest.storage, PUSH_DB_PATH) != 0) {
-        fprintf(stderr, "[scan-ui] sqlite init failed for %s: %s\n", PUSH_DB_PATH, ingest.storage.last_error[0] ? ingest.storage.last_error : "unknown");
+    if (push_storage_init(&ingest.storage, db_path) != 0) {
+        fprintf(stderr, "[scan-ui] sqlite init failed for %s: %s\n", db_path, ingest.storage.last_error[0] ? ingest.storage.last_error : "unknown");
     } else {
         fprintf(stderr, "[scan-ui] sqlite ready: %s\n", ingest.storage.path);
     }
     int traffic_scroll_offset = 0;
-    push_ingest_reset(&ingest, result.weather_station_ip);
+    if (find_available_listener_port(listener_port, &listener_port) != 0) {
+        listener_port = cfg ? cfg->listener_port : PUSH_LISTENER_PORT;
+        fprintf(stderr, "[scan-ui] failed to find a free listener port, using %d\n", listener_port);
+    }
+    push_ingest_reset(&ingest, result.weather_station_ip, listener_port);
     float push_poll_accum = 0.0f;
 #ifndef SCAN_HAS_SDL_TTF
     (void)lines;
@@ -1403,7 +1995,7 @@ static int run_ui_mode(void) {
     fprintf(stderr, "[scan-ui] start: window=%dx%d listener_port=%d weather_ip=%s\n",
             win_w,
             win_h,
-            PUSH_LISTENER_PORT,
+            listener_port,
             ingest.weather.weather_ip[0] ? ingest.weather.weather_ip : "n/a");
 
     char quit_reason[128];
@@ -1469,11 +2061,13 @@ static int run_ui_mode(void) {
 #endif
             } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_r) {
                 scan_err[0] = '\0';
-                scan_ok = (wifi_scan_collect(&result, scan_err, sizeof(scan_err)) == 0);
-                line_count = build_ui_lines(&result, scan_ok, scan_err, lines, UI_MAX_LINES);
+                scan_ok = 0;
+                scan_in_progress = 1;
+                start_ui_scan_worker(&scan_state);
+                line_count = build_ui_lines(&result, scan_ok, scan_err, scan_in_progress, lines, UI_MAX_LINES);
                 scroll_offset = 0;
                 traffic_scroll_offset = 0;
-                push_ingest_reset(&ingest, result.weather_station_ip);
+                push_ingest_reset(&ingest, result.weather_station_ip, ingest.listener_port);
                 push_poll_accum = 0.0f;
             } else if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                 win_w = ev.window.data1;
@@ -1497,6 +2091,15 @@ static int run_ui_mode(void) {
         prev_ticks = now_ticks;
         scan_app_update(&app, dt);
 
+        if (scan_state.active && scan_state.done) {
+            scan_ok = scan_state.scan_ok;
+            snprintf(scan_err, sizeof(scan_err), "%s", scan_state.scan_err);
+            result = scan_state.result;
+            scan_in_progress = 0;
+            line_count = build_ui_lines(&result, scan_ok, scan_err, scan_in_progress, lines, UI_MAX_LINES);
+            scroll_offset = 0;
+        }
+
         push_poll_accum += dt;
         if (push_poll_accum >= PUSH_POLL_INTERVAL_SEC) {
             push_ingest_poll(&ingest);
@@ -1515,6 +2118,9 @@ static int run_ui_mode(void) {
         SDL_RenderDrawRect(renderer, &traffic_panel);
 
         SDL_Color color = {225, 236, 245, 255};
+        SDL_Color header_color = {123, 209, 255, 255};
+        SDL_Color muted_color = {168, 186, 208, 255};
+        SDL_Color accent_color = {255, 212, 123, 255};
         int y = main_panel.y + 10;
         int line_h = TTF_FontLineSkip(font) + 4;
         SDL_Rect main_clip = {
@@ -1535,6 +2141,23 @@ static int run_ui_mode(void) {
         if (scroll_offset > max_offset) {
             scroll_offset = max_offset;
         }
+
+        draw_text_line(renderer, font, main_panel.x + 14, y, "Local network overview", header_color);
+        y += line_h;
+        draw_text_line(renderer, font, main_panel.x + 14, y, "Use R to refresh, scroll to move, Esc to quit", muted_color);
+        y += line_h + 4;
+        char quick_status[UI_LINE_LEN];
+        snprintf(
+            quick_status,
+            sizeof(quick_status),
+            "Live: packets=%d | station=%s | temp=%s°F | wind=%s mph",
+            ingest.weather.messages_received,
+            ingest.weather.station_type[0] ? ingest.weather.station_type : "n/a",
+            ingest.weather.tempf[0] ? ingest.weather.tempf : "n/a",
+            ingest.weather.windspeedmph[0] ? ingest.weather.windspeedmph : "n/a"
+        );
+        draw_text_line(renderer, font, main_panel.x + 10, y, quick_status, accent_color);
+        y += line_h + 2;
 
         for (int i = scroll_offset; i < line_count && (i - scroll_offset) < visible_lines; ++i) {
             draw_text_line(renderer, font, main_panel.x + 10, y, lines[i], color);
@@ -1635,6 +2258,10 @@ static int run_ui_mode(void) {
 #endif
 
         SDL_RenderPresent(renderer);
+        if (weather_renderer) {
+            render_weather_detail_window(weather_renderer, font, &ingest);
+            SDL_RenderPresent(weather_renderer);
+        }
     }
 
     fprintf(stderr, "[scan-ui] exit: %s\n", quit_reason);
@@ -1647,6 +2274,12 @@ static int run_ui_mode(void) {
     TTF_CloseFont(font);
     TTF_Quit();
 #endif
+    if (weather_renderer) {
+        SDL_DestroyRenderer(weather_renderer);
+    }
+    if (weather_window) {
+        SDL_DestroyWindow(weather_window);
+    }
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
@@ -1654,19 +2287,55 @@ static int run_ui_mode(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1 && strcmp(argv[1], "--info") == 0) {
-        return run_info_mode();
-    }
-    if (argc > 1 && strcmp(argv[1], "--export-csv") == 0) {
-        const char *out_path = (argc > 2 && argv[2][0]) ? argv[2] : PUSH_DB_EXPORT_PATH;
-        return run_export_csv_mode(out_path);
-    }
-    if (argc > 1 && strcmp(argv[1], "--ui") == 0) {
-        return run_ui_mode();
-    }
-    if (argc > 1 && strcmp(argv[1], "--scan") == 0) {
-        return run_scan_mode();
+    AppConfig cfg;
+    int lock_fd = -1;
+    int should_guard = 0;
+
+    if (parse_app_config(argc, argv, &cfg) != 0) {
+        return 1;
     }
 
-    return run_scan_mode();
+    if (cfg.show_help) {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    if (cfg.ui_mode) {
+        should_guard = 1;
+    }
+
+    if (should_guard) {
+        int other_running = scan_ui_instance_running(getpid());
+        if (other_running > 0) {
+            fprintf(stderr, "[scan-ui] another instance is already running; refusing to start a duplicate.\n");
+            return 0;
+        }
+        if (other_running < 0) {
+            fprintf(stderr, "[scan-ui] failed to inspect existing processes; continuing with lock fallback.\n");
+        }
+    }
+
+    int lock_rc = acquire_single_instance_lock(SINGLE_INSTANCE_LOCK_PATH, &lock_fd);
+    if (lock_rc != 0) {
+        release_single_instance_lock(lock_fd, SINGLE_INSTANCE_LOCK_PATH);
+        return lock_rc == 1 ? 0 : 1;
+    }
+
+    int rc = 0;
+    if (cfg.info_mode) {
+        rc = run_info_mode();
+    } else if (cfg.export_csv_mode) {
+        rc = run_export_csv_mode(&cfg, cfg.export_csv_path);
+    } else if (cfg.ui_mode) {
+        rc = run_ui_mode(&cfg);
+    } else if (cfg.demo_push_mode) {
+        rc = run_demo_push_mode(&cfg);
+    } else if (cfg.scan_mode) {
+        rc = run_scan_mode();
+    } else {
+        rc = run_scan_mode();
+    }
+
+    release_single_instance_lock(lock_fd, SINGLE_INSTANCE_LOCK_PATH);
+    return rc;
 }

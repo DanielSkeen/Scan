@@ -9,6 +9,7 @@
 int main(int argc, char **argv) {
     const char *host = argc > 1 ? argv[1] : "127.0.0.1";
     int port = argc > 2 ? atoi(argv[2]) : 8089;
+    const char *payload = argc > 3 ? argv[3] : "PASSKEY=734F2DDA57080BEE5D968901653F7821&stationtype=AMBWeatherPro_V5.2.2&dateutc=2026-08-02%2019%3A59%3A29&ID=demo&tempf=91.2&humidity=32&windspeedmph=0.67&windgustmph=1.12&maxdailygust=6.93&winddir=132&uv=10&solarradiation=1054.03&hourlyrainin=0.000&eventrainin=0.000&dailyrainin=0.000&weeklyrainin=0.000&monthlyrainin=0.000&yearlyrainin=8.220&totalrainin=18.039&battout=1&tempinf=74.8&humidityin=51&baromrelin=29.707&baromabsin=29.500";
 
     struct addrinfo hints;
     struct addrinfo *result = NULL;
@@ -45,13 +46,24 @@ int main(int argc, char **argv) {
 
     freeaddrinfo(result);
 
-    const char *request =
-        "GET /?PASSKEY=734F2DDA57080BEE5D968901653F7821&stationtype=AMBWeatherPro_V5.2.2&dateutc=2026-08-02%2019%3A59%3A29&ID=demo&tempf=91.2&humidity=32&windspeedmph=0.67&windgustmph=1.12&maxdailygust=6.93&winddir=132&uv=10&solarradiation=1054.03&hourlyrainin=0.000&eventrainin=0.000&dailyrainin=0.000&weeklyrainin=0.000&monthlyrainin=0.000&yearlyrainin=8.220&totalrainin=18.039&battout=1&tempinf=74.8&humidityin=51&baromrelin=29.707&baromabsin=29.500 HTTP/1.1\r\n"
+    char request[8192];
+    int request_len = snprintf(
+        request,
+        sizeof(request),
+        "GET /weatherstation/updateweatherstation.php?%s HTTP/1.1\r\n"
         "Host: example\r\n"
         "Connection: close\r\n"
-        "\r\n";
+        "\r\n",
+        payload
+    );
 
-    if (send(sock, request, strlen(request), 0) < 0) {
+    if (request_len < 0 || (size_t)request_len >= sizeof(request)) {
+        fprintf(stderr, "request too large\n");
+        close(sock);
+        return 1;
+    }
+
+    if (send(sock, request, (size_t)request_len, 0) < 0) {
         perror("send");
         close(sock);
         return 1;
