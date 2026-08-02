@@ -530,6 +530,11 @@ static int draw_weather_summary(
         lines_used++;
     }
 
+    snprintf(line, sizeof(line), "Parsed fields (last push): %d", weather->latest_field_count);
+    draw_text_line(renderer, font, traffic_panel->x + 10, y, line, color);
+    y += line_h;
+    lines_used++;
+
     if (weather->latest_field_count > 0) {
         draw_text_line(renderer, font, traffic_panel->x + 10, y, "Latest collected fields:", color);
         y += line_h;

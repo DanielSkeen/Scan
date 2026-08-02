@@ -124,7 +124,24 @@ static int handle_client(DevicePushListener *listener, int client_fd, const stru
         return 0;
     }
 
-    const char *query = strchr(uri, '?');
+    const char *query = NULL;
+    int query_skip = 0;
+
+    const char *qmark = strchr(uri, '?');
+    const char *slash_amp = strstr(uri, "/&");
+    const char *amp = strchr(uri, '&');
+
+    if (qmark) {
+        query = qmark;
+        query_skip = 1;
+    } else if (slash_amp) {
+        query = slash_amp;
+        query_skip = 2;
+    } else if (amp) {
+        query = amp;
+        query_skip = 1;
+    }
+
     const char *body = strstr(request, "\r\n\r\n");
     if (body) {
         body += 4;
@@ -138,7 +155,7 @@ static int handle_client(DevicePushListener *listener, int client_fd, const stru
         }
         memcpy(msg.path, uri, path_len);
         msg.path[path_len] = '\0';
-        msg.field_count = append_parsed_fields(query + 1, msg.fields, msg.field_count, DEVICE_PUSH_MAX_FIELDS);
+        msg.field_count = append_parsed_fields(query + query_skip, msg.fields, msg.field_count, DEVICE_PUSH_MAX_FIELDS);
     } else {
         snprintf(msg.path, sizeof(msg.path), "%s", uri);
     }
