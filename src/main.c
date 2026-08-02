@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+#include <sqlite3.h>
 #include <SDL.h>
 #ifdef SCAN_HAS_SDL_TTF
 #include <SDL_ttf.h>
@@ -24,6 +25,12 @@
 #define UI_PANEL_GAP 10
 #define PUSH_LISTENER_PORT 8089
 #define PUSH_POLL_INTERVAL_SEC 1.0f
+#define PUSH_DB_PATH "scan_packets.db"
+#define PUSH_DB_RETENTION_DAYS 90
+#define RECENT_PACKET_ROWS 6
+#define PUSH_DB_EXPORT_PATH "weather_packets.csv"
+#define EXIT_DB_PREVIEW_ROWS 10
+#define EXIT_DB_SUMMARY_PATH "scan_exit_db_summary.txt"
 
 static int run_info_mode(void) {
     puts(scan_banner());
@@ -177,6 +184,14 @@ static void end_clip(SDL_Renderer *renderer) {
 #endif
 
 typedef struct {
+    sqlite3 *db;
+    sqlite3_stmt *insert_stmt;
+    char path[256];
+    char last_error[256];
+    int pruned_rows;
+} PushStorage;
+
+typedef struct {
     char weather_ip[16];
     time_t last_update;
     int messages_received;
@@ -208,7 +223,11 @@ typedef struct {
 
 typedef struct {
     DevicePushListener listener;
+    PushStorage storage;
+    int storage_error_reported;
     WeatherPushData weather;
+    char recent_packets[RECENT_PACKET_ROWS][UI_LINE_LEN];
+    int recent_packet_count;
     char lines[UI_TRAFFIC_MAX_LINES][UI_LINE_LEN];
     int line_count;
 } PushIngestState;
@@ -242,9 +261,642 @@ static void copy_if_present(char *dst, size_t dst_sz, const char *src) {
     }
 }
 
+static void push_storage_set_error(PushStorage *storage, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(storage->last_error, sizeof(storage->last_error), fmt, ap);
+    va_end(ap);
+}
+
+static int push_storage_exec(PushStorage *storage, const char *sql) {
+    char *err = NULL;
+    int rc = sqlite3_exec(storage->db, sql, NULL, NULL, &err);
+    if (rc != SQLITE_OK) {
+        push_storage_set_error(storage, "sql exec failed: %s", err ? err : "unknown");
+        sqlite3_free(err);
+        return -1;
+    }
+    return 0;
+}
+
+static int push_storage_apply_retention(PushStorage *storage, int retention_days) {
+    if (retention_days <= 0) {
+        storage->pruned_rows = 0;
+        return 0;
+    }
+
+    const time_t now = time(NULL);
+    const time_t cutoff = now - ((time_t)retention_days * 24 * 60 * 60);
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(
+        storage->db,
+        "DELETE FROM weather_packets WHERE received_at < ?;",
+        -1,
+        &stmt,
+        NULL
+    );
+    if (rc != SQLITE_OK) {
+        push_storage_set_error(storage, "retention prepare failed: %s", sqlite3_errmsg(storage->db));
+        return -1;
+    }
+
+    rc = sqlite3_bind_int64(stmt, 1, (sqlite3_int64)cutoff);
+    if (rc != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        push_storage_set_error(storage, "retention bind failed: %s", sqlite3_errmsg(storage->db));
+        return -1;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        push_storage_set_error(storage, "retention delete failed: %s", sqlite3_errmsg(storage->db));
+        return -1;
+    }
+
+    storage->pruned_rows = sqlite3_changes(storage->db);
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+static int push_storage_refresh_recent(PushStorage *storage, char rows[][UI_LINE_LEN], int max_rows) {
+    if (!storage || !storage->db || !rows || max_rows <= 0) {
+        return 0;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(
+        storage->db,
+        "SELECT received_at, station_id, tempf, humidity, windspeedmph "
+        "FROM weather_packets ORDER BY id DESC LIMIT ?;",
+        -1,
+        &stmt,
+        NULL
+    );
+    if (rc != SQLITE_OK) {
+        push_storage_set_error(storage, "recent query prepare failed: %s", sqlite3_errmsg(storage->db));
+        return -1;
+    }
+
+    rc = sqlite3_bind_int(stmt, 1, max_rows);
+    if (rc != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        push_storage_set_error(storage, "recent query bind failed: %s", sqlite3_errmsg(storage->db));
+        return -1;
+    }
+
+    int count = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && count < max_rows) {
+        time_t ts = (time_t)sqlite3_column_int64(stmt, 0);
+        const unsigned char *station = sqlite3_column_text(stmt, 1);
+        const unsigned char *tempf = sqlite3_column_text(stmt, 2);
+        const unsigned char *humidity = sqlite3_column_text(stmt, 3);
+        const unsigned char *wind = sqlite3_column_text(stmt, 4);
+
+        struct tm tm_snapshot;
+        char time_buf[16] = "";
+        localtime_r(&ts, &tm_snapshot);
+        strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &tm_snapshot);
+
+        snprintf(
+            rows[count],
+            UI_LINE_LEN,
+            "%s ID=%s T=%s RH=%s W=%s",
+            time_buf,
+            station ? (const char *)station : "-",
+            tempf ? (const char *)tempf : "-",
+            humidity ? (const char *)humidity : "-",
+            wind ? (const char *)wind : "-"
+        );
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        push_storage_set_error(storage, "recent query step failed: %s", sqlite3_errmsg(storage->db));
+        return -1;
+    }
+
+    return count;
+}
+
+static void copy_raw_field_value(const char *raw_fields, const char *key, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!raw_fields || !key || key[0] == '\0') {
+        return;
+    }
+
+    size_t key_len = strlen(key);
+    const char *cursor = raw_fields;
+    while (cursor && *cursor) {
+        const char *next = strchr(cursor, '&');
+        const char *eq = strchr(cursor, '=');
+        if (eq && (!next || eq < next)) {
+            size_t token_key_len = (size_t)(eq - cursor);
+            if (token_key_len == key_len && strncmp(cursor, key, key_len) == 0) {
+                const char *value = eq + 1;
+                size_t value_len = next ? (size_t)(next - value) : strlen(value);
+                if (value_len >= out_sz) {
+                    value_len = out_sz - 1;
+                }
+                memcpy(out, value, value_len);
+                out[value_len] = '\0';
+                return;
+            }
+        }
+        cursor = next ? (next + 1) : NULL;
+    }
+}
+
+static void push_storage_print_exit_summary(PushStorage *storage, int max_rows) {
+    if (!storage || !storage->db || max_rows <= 0) {
+        return;
+    }
+
+    FILE *summary_file = fopen(EXIT_DB_SUMMARY_PATH, "w");
+    if (!summary_file) {
+        fprintf(stderr, "[scan-ui] failed to open %s: %s\n", EXIT_DB_SUMMARY_PATH, strerror(errno));
+    }
+
+    sqlite3_stmt *count_stmt = NULL;
+    sqlite3_stmt *rows_stmt = NULL;
+    int total_rows = 0;
+
+    if (sqlite3_prepare_v2(storage->db, "SELECT COUNT(*) FROM weather_packets;", -1, &count_stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(count_stmt) == SQLITE_ROW) {
+            total_rows = sqlite3_column_int(count_stmt, 0);
+        }
+    }
+    if (count_stmt) {
+        sqlite3_finalize(count_stmt);
+    }
+
+    fprintf(stderr, "[scan-ui] db summary on exit: %d total packet(s) in %s\n", total_rows, storage->path);
+    if (summary_file) {
+        fprintf(summary_file, "[scan-ui] db summary on exit: %d total packet(s) in %s\n", total_rows, storage->path);
+    }
+
+    if (sqlite3_prepare_v2(
+            storage->db,
+            "SELECT received_at, station_id, tempf, humidity, windspeedmph, windgustmph, winddir, "
+            "baromrelin, rainratein, eventrainin, dailyrainin, weeklyrainin, monthlyrainin, yearlyrainin, "
+            "uv, solarradiation, indoortempf, indoorhumidity, field_count, raw_fields "
+            "FROM weather_packets ORDER BY id DESC LIMIT ?;",
+            -1,
+            &rows_stmt,
+            NULL
+        ) != SQLITE_OK) {
+        fprintf(stderr, "[scan-ui] db summary query failed: %s\n", sqlite3_errmsg(storage->db));
+        if (summary_file) {
+            fprintf(summary_file, "[scan-ui] db summary query failed: %s\n", sqlite3_errmsg(storage->db));
+            fclose(summary_file);
+        }
+        return;
+    }
+
+    if (sqlite3_bind_int(rows_stmt, 1, max_rows) != SQLITE_OK) {
+        fprintf(stderr, "[scan-ui] db summary bind failed: %s\n", sqlite3_errmsg(storage->db));
+        if (summary_file) {
+            fprintf(summary_file, "[scan-ui] db summary bind failed: %s\n", sqlite3_errmsg(storage->db));
+            fclose(summary_file);
+        }
+        sqlite3_finalize(rows_stmt);
+        return;
+    }
+
+    int printed = 0;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(rows_stmt)) == SQLITE_ROW) {
+        time_t ts = (time_t)sqlite3_column_int64(rows_stmt, 0);
+        const unsigned char *station_id = sqlite3_column_text(rows_stmt, 1);
+        const unsigned char *tempf = sqlite3_column_text(rows_stmt, 2);
+        const unsigned char *humidity = sqlite3_column_text(rows_stmt, 3);
+        const unsigned char *windspeed = sqlite3_column_text(rows_stmt, 4);
+        const unsigned char *windgust = sqlite3_column_text(rows_stmt, 5);
+        const unsigned char *winddir = sqlite3_column_text(rows_stmt, 6);
+        const unsigned char *baromrelin = sqlite3_column_text(rows_stmt, 7);
+        const unsigned char *rainratein = sqlite3_column_text(rows_stmt, 8);
+        const unsigned char *eventrainin = sqlite3_column_text(rows_stmt, 9);
+        const unsigned char *dailyrainin = sqlite3_column_text(rows_stmt, 10);
+        const unsigned char *weeklyrainin = sqlite3_column_text(rows_stmt, 11);
+        const unsigned char *monthlyrainin = sqlite3_column_text(rows_stmt, 12);
+        const unsigned char *yearlyrainin = sqlite3_column_text(rows_stmt, 13);
+        const unsigned char *uv = sqlite3_column_text(rows_stmt, 14);
+        const unsigned char *solarradiation = sqlite3_column_text(rows_stmt, 15);
+        const unsigned char *indoortempf = sqlite3_column_text(rows_stmt, 16);
+        const unsigned char *indoorhumidity = sqlite3_column_text(rows_stmt, 17);
+        int field_count = sqlite3_column_int(rows_stmt, 18);
+        const unsigned char *raw_fields = sqlite3_column_text(rows_stmt, 19);
+
+        char maxdailygust[32] = "";
+        char totalrainin[32] = "";
+        char battout[32] = "";
+        copy_raw_field_value((const char *)raw_fields, "maxdailygust", maxdailygust, sizeof(maxdailygust));
+        copy_raw_field_value((const char *)raw_fields, "totalrainin", totalrainin, sizeof(totalrainin));
+        copy_raw_field_value((const char *)raw_fields, "battout", battout, sizeof(battout));
+
+        struct tm tm_snapshot;
+        char ts_buf[32] = "";
+        localtime_r(&ts, &tm_snapshot);
+        strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S", &tm_snapshot);
+
+        fprintf(
+            stderr,
+            "[scan-ui] db row: ts=%s ID=%s tempf=%s humidity=%s wind=%s gust=%s maxgust=%s dir=%s barom=%s "
+            "rainrate=%s event=%s day=%s week=%s month=%s year=%s total=%s uv=%s solar=%s "
+            "indoor_tempf=%s indoor_rh=%s battout=%s fields=%d raw=%s\n",
+            ts_buf,
+            station_id ? (const char *)station_id : "-",
+            tempf ? (const char *)tempf : "-",
+            humidity ? (const char *)humidity : "-",
+            windspeed ? (const char *)windspeed : "-",
+            windgust ? (const char *)windgust : "-",
+            maxdailygust[0] ? maxdailygust : "-",
+            winddir ? (const char *)winddir : "-",
+            baromrelin ? (const char *)baromrelin : "-",
+            rainratein ? (const char *)rainratein : "-",
+            eventrainin ? (const char *)eventrainin : "-",
+            dailyrainin ? (const char *)dailyrainin : "-",
+            weeklyrainin ? (const char *)weeklyrainin : "-",
+            monthlyrainin ? (const char *)monthlyrainin : "-",
+            yearlyrainin ? (const char *)yearlyrainin : "-",
+            totalrainin[0] ? totalrainin : "-",
+            uv ? (const char *)uv : "-",
+            solarradiation ? (const char *)solarradiation : "-",
+            indoortempf ? (const char *)indoortempf : "-",
+            indoorhumidity ? (const char *)indoorhumidity : "-",
+            battout[0] ? battout : "-",
+            field_count,
+            raw_fields ? (const char *)raw_fields : "-"
+        );
+        if (summary_file) {
+            fprintf(
+                summary_file,
+                "[scan-ui] db row: ts=%s ID=%s tempf=%s humidity=%s wind=%s gust=%s maxgust=%s dir=%s barom=%s "
+                "rainrate=%s event=%s day=%s week=%s month=%s year=%s total=%s uv=%s solar=%s "
+                "indoor_tempf=%s indoor_rh=%s battout=%s fields=%d raw=%s\n",
+                ts_buf,
+                station_id ? (const char *)station_id : "-",
+                tempf ? (const char *)tempf : "-",
+                humidity ? (const char *)humidity : "-",
+                windspeed ? (const char *)windspeed : "-",
+                windgust ? (const char *)windgust : "-",
+                maxdailygust[0] ? maxdailygust : "-",
+                winddir ? (const char *)winddir : "-",
+                baromrelin ? (const char *)baromrelin : "-",
+                rainratein ? (const char *)rainratein : "-",
+                eventrainin ? (const char *)eventrainin : "-",
+                dailyrainin ? (const char *)dailyrainin : "-",
+                weeklyrainin ? (const char *)weeklyrainin : "-",
+                monthlyrainin ? (const char *)monthlyrainin : "-",
+                yearlyrainin ? (const char *)yearlyrainin : "-",
+                totalrainin[0] ? totalrainin : "-",
+                uv ? (const char *)uv : "-",
+                solarradiation ? (const char *)solarradiation : "-",
+                indoortempf ? (const char *)indoortempf : "-",
+                indoorhumidity ? (const char *)indoorhumidity : "-",
+                battout[0] ? battout : "-",
+                field_count,
+                raw_fields ? (const char *)raw_fields : "-"
+            );
+        }
+        printed++;
+    }
+
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "[scan-ui] db summary step failed: %s\n", sqlite3_errmsg(storage->db));
+        if (summary_file) {
+            fprintf(summary_file, "[scan-ui] db summary step failed: %s\n", sqlite3_errmsg(storage->db));
+        }
+    } else if (printed == 0) {
+        fprintf(stderr, "[scan-ui] db row: no packet rows available\n");
+        if (summary_file) {
+            fprintf(summary_file, "[scan-ui] db row: no packet rows available\n");
+        }
+    }
+
+    sqlite3_finalize(rows_stmt);
+    if (summary_file) {
+        fclose(summary_file);
+        fprintf(stderr, "[scan-ui] db summary saved to %s\n", EXIT_DB_SUMMARY_PATH);
+    }
+}
+
+static void csv_write_escaped(FILE *f, const char *text) {
+    fputc('"', f);
+    for (const char *p = text; p && *p; ++p) {
+        if (*p == '"') {
+            fputc('"', f);
+        }
+        fputc(*p, f);
+    }
+    fputc('"', f);
+}
+
+static int run_export_csv_mode(const char *csv_path) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+
+    if (sqlite3_open(PUSH_DB_PATH, &db) != SQLITE_OK) {
+        fprintf(stderr, "Failed to open %s: %s\n", PUSH_DB_PATH, sqlite3_errmsg(db));
+        if (db) {
+            sqlite3_close(db);
+        }
+        return 1;
+    }
+
+    FILE *out = fopen(csv_path, "w");
+    if (!out) {
+        fprintf(stderr, "Failed to open %s: %s\n", csv_path, strerror(errno));
+        sqlite3_close(db);
+        return 1;
+    }
+
+    const char *sql =
+        "SELECT received_at, client_ip, method, path, station_id, station_type, tempf, humidity,"
+        "windspeedmph, windgustmph, winddir, baromrelin, baromabsin, rainratein, eventrainin,"
+        "hourlyrainin, dailyrainin, weeklyrainin, monthlyrainin, yearlyrainin, uv, solarradiation,"
+        "indoortempf, indoorhumidity, field_count, raw_fields "
+        "FROM weather_packets ORDER BY id;";
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare export query: %s\n", sqlite3_errmsg(db));
+        fclose(out);
+        sqlite3_close(db);
+        return 1;
+    }
+
+    fprintf(
+        out,
+        "received_at,client_ip,method,path,station_id,station_type,tempf,humidity,"
+        "windspeedmph,windgustmph,winddir,baromrelin,baromabsin,rainratein,eventrainin,"
+        "hourlyrainin,dailyrainin,weeklyrainin,monthlyrainin,yearlyrainin,uv,solarradiation,"
+        "indoortempf,indoorhumidity,field_count,raw_fields\n"
+    );
+
+    int row_count = 0;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        sqlite3_int64 received_at = sqlite3_column_int64(stmt, 0);
+        fprintf(out, "%lld,", (long long)received_at);
+
+        for (int i = 1; i <= 23; ++i) {
+            const unsigned char *text = sqlite3_column_text(stmt, i);
+            csv_write_escaped(out, text ? (const char *)text : "");
+            fputc(',', out);
+        }
+
+        int field_count = sqlite3_column_int(stmt, 24);
+        fprintf(out, "%d,", field_count);
+
+        const unsigned char *raw_fields = sqlite3_column_text(stmt, 25);
+        csv_write_escaped(out, raw_fields ? (const char *)raw_fields : "");
+        fputc('\n', out);
+        row_count++;
+    }
+
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "Failed during export: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        fclose(out);
+        sqlite3_close(db);
+        return 1;
+    }
+
+    sqlite3_finalize(stmt);
+    fclose(out);
+    sqlite3_close(db);
+
+    printf("Exported %d packet rows to %s\n", row_count, csv_path);
+    return 0;
+}
+
+static int push_storage_init(PushStorage *storage, const char *db_path) {
+    memset(storage, 0, sizeof(*storage));
+    snprintf(storage->path, sizeof(storage->path), "%s", db_path);
+
+    int rc = sqlite3_open(storage->path, &storage->db);
+    if (rc != SQLITE_OK) {
+        push_storage_set_error(storage, "open failed: %s", storage->db ? sqlite3_errmsg(storage->db) : "unknown");
+        if (storage->db) {
+            sqlite3_close(storage->db);
+            storage->db = NULL;
+        }
+        return -1;
+    }
+
+    if (push_storage_exec(storage, "PRAGMA journal_mode=WAL;") != 0) {
+        return -1;
+    }
+    if (push_storage_exec(storage, "PRAGMA synchronous=NORMAL;") != 0) {
+        return -1;
+    }
+
+    if (push_storage_exec(
+            storage,
+            "CREATE TABLE IF NOT EXISTS weather_packets ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "received_at INTEGER NOT NULL,"
+            "client_ip TEXT,"
+            "method TEXT,"
+            "path TEXT,"
+            "station_id TEXT,"
+            "station_type TEXT,"
+            "tempf TEXT,"
+            "humidity TEXT,"
+            "windspeedmph TEXT,"
+            "windgustmph TEXT,"
+            "winddir TEXT,"
+            "baromrelin TEXT,"
+            "baromabsin TEXT,"
+            "rainratein TEXT,"
+            "eventrainin TEXT,"
+            "hourlyrainin TEXT,"
+            "dailyrainin TEXT,"
+            "weeklyrainin TEXT,"
+            "monthlyrainin TEXT,"
+            "yearlyrainin TEXT,"
+            "uv TEXT,"
+            "solarradiation TEXT,"
+            "indoortempf TEXT,"
+            "indoorhumidity TEXT,"
+            "field_count INTEGER NOT NULL,"
+            "raw_fields TEXT"
+            ");") != 0) {
+        return -1;
+    }
+
+    if (push_storage_exec(storage, "CREATE INDEX IF NOT EXISTS idx_weather_packets_received_at ON weather_packets(received_at);") != 0) {
+        return -1;
+    }
+    if (push_storage_exec(storage, "CREATE INDEX IF NOT EXISTS idx_weather_packets_station_id ON weather_packets(station_id);") != 0) {
+        return -1;
+    }
+
+    if (push_storage_apply_retention(storage, PUSH_DB_RETENTION_DAYS) != 0) {
+        return -1;
+    }
+
+    const char *insert_sql =
+        "INSERT INTO weather_packets ("
+        "received_at, client_ip, method, path, station_id, station_type, tempf, humidity,"
+        "windspeedmph, windgustmph, winddir, baromrelin, baromabsin, rainratein, eventrainin,"
+        "hourlyrainin, dailyrainin, weeklyrainin, monthlyrainin, yearlyrainin, uv, solarradiation,"
+        "indoortempf, indoorhumidity, field_count, raw_fields"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
+
+    rc = sqlite3_prepare_v2(storage->db, insert_sql, -1, &storage->insert_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        push_storage_set_error(storage, "prepare failed: %s", sqlite3_errmsg(storage->db));
+        return -1;
+    }
+
+    storage->last_error[0] = '\0';
+    return 0;
+}
+
+static void push_storage_close(PushStorage *storage) {
+    if (storage->insert_stmt) {
+        sqlite3_finalize(storage->insert_stmt);
+        storage->insert_stmt = NULL;
+    }
+    if (storage->db) {
+        sqlite3_close(storage->db);
+        storage->db = NULL;
+    }
+}
+
+static void push_storage_build_raw_fields(const DevicePushMessage *msg, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    size_t used = 0;
+    for (int i = 0; i < msg->field_count; ++i) {
+        int written = snprintf(
+            out + used,
+            out_sz - used,
+            "%s%s=%s",
+            (i == 0) ? "" : "&",
+            msg->fields[i].key,
+            msg->fields[i].value
+        );
+        if (written < 0) {
+            out[0] = '\0';
+            return;
+        }
+        if ((size_t)written >= out_sz - used) {
+            used = out_sz - 1;
+            break;
+        }
+        used += (size_t)written;
+    }
+    out[used] = '\0';
+}
+
+static int bind_text_or_null(sqlite3_stmt *stmt, int idx, const char *val) {
+    if (val && val[0]) {
+        return sqlite3_bind_text(stmt, idx, val, -1, SQLITE_TRANSIENT);
+    }
+    return sqlite3_bind_null(stmt, idx);
+}
+
+static int push_storage_insert(PushStorage *storage, const DevicePushMessage *msg) {
+    if (!storage || !storage->db || !storage->insert_stmt || !msg) {
+        return 0;
+    }
+
+    const char *station_id = push_field_value(msg, "ID");
+    const char *station_type = push_field_value(msg, "stationtype");
+    const char *tempf = push_field_value(msg, "tempf");
+    const char *humidity = push_field_value(msg, "humidity");
+    const char *windspeedmph = push_field_value(msg, "windspeedmph");
+    const char *windgustmph = push_field_value(msg, "windgustmph");
+    const char *winddir = push_field_value(msg, "winddir");
+    const char *baromrelin = push_field_value(msg, "baromrelin");
+    const char *baromabsin = push_field_value(msg, "baromabsin");
+    const char *rainratein = push_field_value(msg, "rainratein");
+    const char *eventrainin = push_field_value(msg, "eventrainin");
+    const char *hourlyrainin = push_field_value(msg, "hourlyrainin");
+    const char *dailyrainin = push_field_value(msg, "dailyrainin");
+    const char *weeklyrainin = push_field_value(msg, "weeklyrainin");
+    const char *monthlyrainin = push_field_value(msg, "monthlyrainin");
+    const char *yearlyrainin = push_field_value(msg, "yearlyrainin");
+    const char *uv = push_field_value(msg, "uv");
+    const char *solarradiation = push_field_value(msg, "solarradiation");
+    const char *indoortempf = push_field_value(msg, "indoortempf");
+    const char *indoorhumidity = push_field_value(msg, "indoorhumidity");
+
+    char raw_fields[4096];
+    push_storage_build_raw_fields(msg, raw_fields, sizeof(raw_fields));
+
+    sqlite3_stmt *stmt = storage->insert_stmt;
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+
+    int rc = SQLITE_OK;
+    rc |= sqlite3_bind_int64(stmt, 1, (sqlite3_int64)msg->received_at);
+    rc |= bind_text_or_null(stmt, 2, msg->client_ip);
+    rc |= bind_text_or_null(stmt, 3, msg->method);
+    rc |= bind_text_or_null(stmt, 4, msg->path);
+    rc |= bind_text_or_null(stmt, 5, station_id);
+    rc |= bind_text_or_null(stmt, 6, station_type);
+    rc |= bind_text_or_null(stmt, 7, tempf);
+    rc |= bind_text_or_null(stmt, 8, humidity);
+    rc |= bind_text_or_null(stmt, 9, windspeedmph);
+    rc |= bind_text_or_null(stmt, 10, windgustmph);
+    rc |= bind_text_or_null(stmt, 11, winddir);
+    rc |= bind_text_or_null(stmt, 12, baromrelin);
+    rc |= bind_text_or_null(stmt, 13, baromabsin);
+    rc |= bind_text_or_null(stmt, 14, rainratein);
+    rc |= bind_text_or_null(stmt, 15, eventrainin);
+    rc |= bind_text_or_null(stmt, 16, hourlyrainin);
+    rc |= bind_text_or_null(stmt, 17, dailyrainin);
+    rc |= bind_text_or_null(stmt, 18, weeklyrainin);
+    rc |= bind_text_or_null(stmt, 19, monthlyrainin);
+    rc |= bind_text_or_null(stmt, 20, yearlyrainin);
+    rc |= bind_text_or_null(stmt, 21, uv);
+    rc |= bind_text_or_null(stmt, 22, solarradiation);
+    rc |= bind_text_or_null(stmt, 23, indoortempf);
+    rc |= bind_text_or_null(stmt, 24, indoorhumidity);
+    rc |= sqlite3_bind_int(stmt, 25, msg->field_count);
+    rc |= bind_text_or_null(stmt, 26, raw_fields);
+
+    if (rc != SQLITE_OK) {
+        push_storage_set_error(storage, "bind failed: %s", sqlite3_errmsg(storage->db));
+        return -1;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        push_storage_set_error(storage, "insert failed: %s", sqlite3_errmsg(storage->db));
+        return -1;
+    }
+
+    return 0;
+}
+
 static int weather_push_parser(const DevicePushMessage *msg, void *user_data) {
     PushIngestState *state = (PushIngestState *)user_data;
     WeatherPushData *weather = &state->weather;
+
+    if (push_storage_insert(&state->storage, msg) != 0 && !state->storage_error_reported) {
+        char line[UI_LINE_LEN];
+        snprintf(line, sizeof(line), "Storage write failed: %s", state->storage.last_error[0] ? state->storage.last_error : "unknown");
+        ingest_append_line(state, line);
+        fprintf(stderr, "[scan-ui] %s\n", line);
+        state->storage_error_reported = 1;
+    }
+
+    int refreshed = push_storage_refresh_recent(&state->storage, state->recent_packets, RECENT_PACKET_ROWS);
+    if (refreshed >= 0) {
+        state->recent_packet_count = refreshed;
+    }
 
     const char *stationtype = push_field_value(msg, "stationtype");
     const char *tempf = push_field_value(msg, "tempf");
@@ -347,7 +999,19 @@ static void push_ingest_reset(PushIngestState *state, const char *weather_ip) {
     if (weather_ip && weather_ip[0] != '\0') {
         snprintf(state->weather.weather_ip, sizeof(state->weather.weather_ip), "%s", weather_ip);
     }
+    state->recent_packet_count = 0;
     ingest_append_line(state, "Weather push listener");
+    if (state->storage.db) {
+        char storage_line[UI_LINE_LEN];
+        snprintf(storage_line, sizeof(storage_line), "Storage DB: %s", state->storage.path);
+        ingest_append_line(state, storage_line);
+        snprintf(storage_line, sizeof(storage_line), "Retention: %d days (startup prune=%d)", PUSH_DB_RETENTION_DAYS, state->storage.pruned_rows);
+        ingest_append_line(state, storage_line);
+        int refreshed = push_storage_refresh_recent(&state->storage, state->recent_packets, RECENT_PACKET_ROWS);
+        if (refreshed >= 0) {
+            state->recent_packet_count = refreshed;
+        }
+    }
 
     if (device_push_listener_start(&state->listener, PUSH_LISTENER_PORT, weather_push_parser, state) != 0) {
         char line[UI_LINE_LEN];
@@ -386,21 +1050,30 @@ static void push_ingest_poll(PushIngestState *state) {
         return;
     }
 
+    if (state->storage.db) {
+        int refreshed = push_storage_refresh_recent(&state->storage, state->recent_packets, RECENT_PACKET_ROWS);
+        if (refreshed >= 0) {
+            state->recent_packet_count = refreshed;
+        }
+    }
+
     (void)handled;
 }
 
 static void push_ingest_stop(PushIngestState *state) {
     device_push_listener_stop(&state->listener);
+    push_storage_close(&state->storage);
 }
 
 static int draw_weather_summary(
     SDL_Renderer *renderer,
     TTF_Font *font,
     const SDL_Rect *traffic_panel,
-    const WeatherPushData *weather,
+    const PushIngestState *state,
     SDL_Color color,
     int line_h
 ) {
+    const WeatherPushData *weather = &state->weather;
     char line[UI_LINE_LEN];
     int y = traffic_panel->y + 10;
     int lines_used = 0;
@@ -558,6 +1231,24 @@ static int draw_weather_summary(
         if (weather->latest_field_count > to_show) {
             snprintf(line, sizeof(line), "... and %d more", weather->latest_field_count - to_show);
             draw_text_line(renderer, font, traffic_panel->x + 10, y, line, color);
+            y += line_h;
+            lines_used++;
+        }
+    }
+
+    draw_text_line(renderer, font, traffic_panel->x + 10, y, "Recent packets from DB:", color);
+    y += line_h;
+    lines_used++;
+
+    if (state->recent_packet_count <= 0) {
+        draw_text_line(renderer, font, traffic_panel->x + 10, y, "- none yet", color);
+        y += line_h;
+        lines_used++;
+    } else {
+        for (int i = 0; i < state->recent_packet_count; ++i) {
+            snprintf(line, sizeof(line), "- %s", state->recent_packets[i]);
+            draw_text_line(renderer, font, traffic_panel->x + 10, y, line, color);
+            y += line_h;
             lines_used++;
         }
     }
@@ -679,6 +1370,12 @@ static int run_ui_mode(void) {
     int scroll_offset = 0;
     PushIngestState ingest;
     memset(&ingest, 0, sizeof(ingest));
+    ingest.storage_error_reported = 0;
+    if (push_storage_init(&ingest.storage, PUSH_DB_PATH) != 0) {
+        fprintf(stderr, "[scan-ui] sqlite init failed for %s: %s\n", PUSH_DB_PATH, ingest.storage.last_error[0] ? ingest.storage.last_error : "unknown");
+    } else {
+        fprintf(stderr, "[scan-ui] sqlite ready: %s\n", ingest.storage.path);
+    }
     int traffic_scroll_offset = 0;
     push_ingest_reset(&ingest, result.weather_station_ip);
     float push_poll_accum = 0.0f;
@@ -883,7 +1580,7 @@ static int run_ui_mode(void) {
             traffic_panel.h - 16
         };
         begin_clip(renderer, &traffic_clip);
-        int summary_lines = draw_weather_summary(renderer, font, &traffic_panel, &ingest.weather, traffic_color, line_h);
+        int summary_lines = draw_weather_summary(renderer, font, &traffic_panel, &ingest, traffic_color, line_h);
         if (summary_lines < 1) {
             summary_lines = 1;
         }
@@ -942,6 +1639,8 @@ static int run_ui_mode(void) {
 
     fprintf(stderr, "[scan-ui] exit: %s\n", quit_reason);
 
+    push_storage_print_exit_summary(&ingest.storage, EXIT_DB_PREVIEW_ROWS);
+
     push_ingest_stop(&ingest);
 
 #ifdef SCAN_HAS_SDL_TTF
@@ -957,6 +1656,10 @@ static int run_ui_mode(void) {
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--info") == 0) {
         return run_info_mode();
+    }
+    if (argc > 1 && strcmp(argv[1], "--export-csv") == 0) {
+        const char *out_path = (argc > 2 && argv[2][0]) ? argv[2] : PUSH_DB_EXPORT_PATH;
+        return run_export_csv_mode(out_path);
     }
     if (argc > 1 && strcmp(argv[1], "--ui") == 0) {
         return run_ui_mode();

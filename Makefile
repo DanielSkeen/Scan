@@ -1,6 +1,7 @@
 CC = clang
 CFLAGS = -Wall -Wextra -O2 -Iinclude
 TARGET = scan
+SUMMARY_VIEWER = scan_summary_view
 UNAME_S := $(shell uname -s)
 
 SRC_COMMON = src/main.c src/scan_app.c src/device_push.c
@@ -17,6 +18,7 @@ SDL_CFLAGS := $(shell sdl2-config --cflags 2>/dev/null)
 SDL_LIBS := $(shell sdl2-config --libs 2>/dev/null)
 TTF_CFLAGS := $(shell if [ -f /opt/homebrew/include/SDL2/SDL_ttf.h ]; then echo -DSCAN_HAS_SDL_TTF=1; fi)
 TTF_LIBS := $(shell ls /opt/homebrew/lib/libSDL2_ttf* >/dev/null 2>&1 && echo -lSDL2_ttf)
+SQLITE_LIBS := -lsqlite3
 
 ifeq ($(strip $(SDL_CFLAGS)),)
 SDL_CFLAGS := $(shell pkg-config --cflags sdl2 2>/dev/null)
@@ -26,16 +28,30 @@ ifeq ($(strip $(SDL_LIBS)),)
 SDL_LIBS := $(shell pkg-config --libs sdl2 2>/dev/null)
 endif
 
-.PHONY: all clean test run release
-.PHONY: receiver receiver-run
+.PHONY: all clean test run release view-summary view-summary-pretty view-summary-dashboard doit
+.PHONY: receiver receiver-run push-example
 
-all: $(TARGET)
+all: $(TARGET) $(SUMMARY_VIEWER)
 
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(TTF_CFLAGS) -o $@ $(SRC) $(SDL_LIBS) $(TTF_LIBS)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) $(TTF_CFLAGS) -o $@ $(SRC) $(SDL_LIBS) $(TTF_LIBS) $(SQLITE_LIBS)
+
+$(SUMMARY_VIEWER): src/scan_summary_view.c
+	$(CC) $(CFLAGS) -o $@ src/scan_summary_view.c
 
 run: $(TARGET)
 	./$(TARGET)
+
+view-summary: $(SUMMARY_VIEWER)
+	./$(SUMMARY_VIEWER) $(if $(FILE),$(FILE),)
+
+view-summary-pretty: $(SUMMARY_VIEWER)
+	./$(SUMMARY_VIEWER) --pretty $(if $(FILE),$(FILE),)
+
+view-summary-dashboard:
+	ROWS=$(if $(ROWS),$(ROWS),10) sh scripts/view_summary_dashboard.sh $(if $(FILE),$(FILE),)
+
+doit: view-summary-dashboard
 
 test: $(TARGET)
 	./tests/test_smoke.sh
@@ -72,8 +88,11 @@ release: test
 receiver: src/ws_push_receiver.c
 	$(CC) $(CFLAGS) -o ws_push_receiver src/ws_push_receiver.c
 
+push-example: examples/push_sender_example.c
+	$(CC) $(CFLAGS) -o push_sender_example examples/push_sender_example.c
+
 receiver-run: receiver
 	./ws_push_receiver
 
 clean:
-	rm -f $(TARGET) ws_push_receiver
+	rm -f $(TARGET) $(SUMMARY_VIEWER) ws_push_receiver push_sender_example

@@ -32,11 +32,67 @@ The left panel shows full scan details, including weather station ping summary.
 The right panel includes an integrated push listener summary and live push log.
 Press R to refresh, Esc to quit, and use mouse wheel or arrow/page/home/end keys to scroll.
 
+View saved exit DB summary file in terminal:
+
+./scan_summary_view
+
+Pretty-formatted view:
+
+./scan_summary_view --pretty
+
+Shortcut:
+
+make view-summary
+
+Pretty shortcut:
+
+make view-summary-pretty
+
+Visual dashboard shortcut:
+
+make view-summary-dashboard
+
+Environment shortcut name:
+
+make doit
+
+Optional custom path:
+
+./scan_summary_view path/to/summary.txt
+
+Shortcut with custom path:
+
+make view-summary FILE=path/to/summary.txt
+
+Pretty shortcut with custom path:
+
+make view-summary-pretty FILE=path/to/summary.txt
+
+Visual dashboard with custom file and row count:
+
+make view-summary-dashboard FILE=path/to/summary.txt ROWS=15
+
 WS-2902 local push integration:
 - Scan UI listens on port 8089 for weather station HTTP push data.
 - Configure the station custom upload target to <your-mac-ip>:8089.
 - Upload path should be /weatherstation/updateweatherstation.php?
 - The app parses incoming fields once they arrive and updates the right panel.
+
+WS-2902 packet storage (SQLite):
+- Each received weather push packet is written to scan_packets.db.
+- Database table: weather_packets.
+- Indexed columns: received_at and station_id.
+- Stored data includes key weather fields plus raw_fields (all parsed key/value pairs from that push).
+- Startup retention policy removes rows older than 90 days.
+- UI right panel includes a SQL-backed recent packet summary.
+
+Export stored packets to CSV:
+
+./scan --export-csv
+
+Optional custom output path:
+
+./scan --export-csv weather_packets_backup.csv
 
 Run info mode (no window):
 

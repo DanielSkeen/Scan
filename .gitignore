@@ -1,3 +1,10 @@
 scan
+scan_summary_view
+push_sender_example
+scan_exit_db_summary.txt
+weather_packets.csv
 .DS_Store
 .vscode/
+scan_packets.db
+scan_packets.db-shm
+scan_packets.db-wal
