@@ -1421,7 +1421,10 @@ static int draw_weather_summary(
         struct tm tm_snapshot;
         localtime_r(&state->weather.last_update, &tm_snapshot);
         strftime(ts, sizeof(ts), "%H:%M:%S", &tm_snapshot);
-        snprintf(line, sizeof(line), "Last update: %s  Station: %s", ts, state->weather.station_type[0] ? state->weather.station_type : "n/a");
+        snprintf(line, sizeof(line), "Last update: %s | Station: %s | IP: %s",
+            ts,
+            state->weather.station_type[0] ? state->weather.station_type : "n/a",
+            state->weather.weather_ip[0] ? state->weather.weather_ip : "n/a");
         draw_text_line(renderer, font, traffic_panel->x + 10, y, line, accent);
         y += line_h;
         lines_used++;
@@ -1463,8 +1466,8 @@ static int draw_weather_summary(
     lines_used++;
 
     int packet_limit = state->recent_packet_count;
-    if (packet_limit > 3) {
-        packet_limit = 3;
+    if (packet_limit > 4) {
+        packet_limit = 4;
     }
     if (packet_limit <= 0) {
         draw_text_line(renderer, font, traffic_panel->x + 10, y, "- none yet", color);
