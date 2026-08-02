@@ -26,7 +26,7 @@ ifeq ($(strip $(SDL_LIBS)),)
 SDL_LIBS := $(shell pkg-config --libs sdl2 2>/dev/null)
 endif
 
-.PHONY: all clean test run
+.PHONY: all clean test run release
 .PHONY: receiver receiver-run
 
 all: $(TARGET)
@@ -39,6 +39,35 @@ run: $(TARGET)
 
 test: $(TARGET)
 	./tests/test_smoke.sh
+
+release: test
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Usage: make release VERSION=v0.1.0"; \
+		exit 1; \
+	fi
+	@if ! echo "$(VERSION)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "VERSION must look like vMAJOR.MINOR.PATCH (example: v1.2.3)"; \
+		exit 1; \
+	fi
+	@if ! git diff --quiet || ! git diff --cached --quiet; then \
+		echo "Working tree is not clean. Commit or stash changes first."; \
+		exit 1; \
+	fi
+	@if [ "`git branch --show-current`" != "main" ]; then \
+		echo "Releases must be created from main."; \
+		exit 1; \
+	fi
+	@if git rev-parse -q --verify "refs/tags/$(VERSION)" >/dev/null; then \
+		echo "Tag $(VERSION) already exists locally."; \
+		exit 1; \
+	fi
+	@if git ls-remote --exit-code --tags origin "refs/tags/$(VERSION)" >/dev/null 2>&1; then \
+		echo "Tag $(VERSION) already exists on origin."; \
+		exit 1; \
+	fi
+	@git tag -a "$(VERSION)" -m "Release $(VERSION)"
+	@git push origin main --follow-tags
+	@echo "Released $(VERSION)"
 
 receiver: src/ws_push_receiver.c
 	$(CC) $(CFLAGS) -o ws_push_receiver src/ws_push_receiver.c

@@ -50,6 +50,16 @@ Smoke test:
 
 make test
 
+Release (one command):
+
+- ensure all changes are committed on main
+- run: make release VERSION=v0.1.0
+
+What this does:
+- runs the smoke test
+- creates an annotated tag
+- pushes main and the new tag to GitHub
+
 ## ESP32 (ESP-IDF)
 
 The ESP32 project root is esp32.
