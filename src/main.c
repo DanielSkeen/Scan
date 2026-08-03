@@ -20,6 +20,9 @@
 #include "scan_app.h"
 #include "wifi_scan.h"
 #include "device_push.h"
+#include "enphase.h"
+#include "envoy_db.h"
+#include "ecobee.h"
 
 #define UI_MAX_LINES 2048
 #define UI_TRAFFIC_MAX_LINES 1024
@@ -29,7 +32,8 @@
 #define UI_SCROLLBAR_WIDTH 10
 #define UI_PANEL_GAP 10
 #define PUSH_LISTENER_PORT 8089
-#define PUSH_POLL_INTERVAL_SEC 1.0f
+#define PUSH_POLL_INTERVAL_SEC (60.0f)
+#define ENVOY_POLL_INTERVAL_SEC (30)
 #define PUSH_DB_PATH "scan_packets.db"
 #define PUSH_DB_RETENTION_DAYS 90
 #define RECENT_PACKET_ROWS 6
@@ -41,14 +45,19 @@
 typedef struct {
     int listener_port;
     char db_path[512];
+    char envoy_host[64];
     int has_port_override;
     int has_db_override;
+    int has_envoy_host_override;
     int ui_mode;
     int scan_mode;
     int info_mode;
     int demo_push_mode;
     int export_csv_mode;
+    int envoy_history_mode;
+    int envoy_export_csv_mode;
     const char *export_csv_path;
+    const char *envoy_history_csv_path;
     int show_help;
 } AppConfig;
 
@@ -56,6 +65,7 @@ static void app_config_init(AppConfig *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->listener_port = PUSH_LISTENER_PORT;
     snprintf(cfg->db_path, sizeof(cfg->db_path), "%s", PUSH_DB_PATH);
+    cfg->envoy_host[0] = '\0';
     cfg->export_csv_path = PUSH_DB_EXPORT_PATH;
 }
 
@@ -77,6 +87,13 @@ static int parse_app_config(int argc, char **argv, AppConfig *cfg) {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 cfg->export_csv_path = argv[++i];
             }
+        } else if (strcmp(arg, "--envoy-history") == 0) {
+            cfg->envoy_history_mode = 1;
+        } else if (strcmp(arg, "--envoy-export-csv") == 0) {
+            cfg->envoy_export_csv_mode = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                cfg->envoy_history_csv_path = argv[++i];
+            }
         } else if (strcmp(arg, "--port") == 0) {
             if (i + 1 >= argc || argv[i + 1][0] == '\0') {
                 fprintf(stderr, "missing value for --port\n");
@@ -91,6 +108,13 @@ static int parse_app_config(int argc, char **argv, AppConfig *cfg) {
             }
             snprintf(cfg->db_path, sizeof(cfg->db_path), "%s", argv[++i]);
             cfg->has_db_override = 1;
+        } else if (strcmp(arg, "--envoy-host") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                fprintf(stderr, "missing value for --envoy-host\n");
+                return -1;
+            }
+            snprintf(cfg->envoy_host, sizeof(cfg->envoy_host), "%s", argv[++i]);
+            cfg->has_envoy_host_override = 1;
         } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
             cfg->show_help = 1;
         } else if (arg[0] == '-') {
@@ -103,14 +127,17 @@ static int parse_app_config(int argc, char **argv, AppConfig *cfg) {
 }
 
 static void print_usage(const char *prog) {
-    printf("Usage: %s [--ui] [--scan] [--info] [--demo-push] [--export-csv [file]] [--port N] [--db PATH]\n", prog);
-    puts("  --ui             launch the SDL windowed UI");
-    puts("  --scan           run the network scan once");
-    puts("  --info           show app info");
-    puts("  --demo-push     send a demo weather push");
-    puts("  --export-csv    export stored packets to CSV");
-    puts("  --port N         override the listener port");
-    puts("  --db PATH        override the SQLite database path");
+    printf("Usage: %s [--ui] [--scan] [--info] [--demo-push] [--export-csv [file]] [--envoy-history] [--port N] [--db PATH]\n", prog);
+    puts("  --ui               launch the SDL windowed UI");
+    puts("  --scan             run the network scan once");
+    puts("  --info             show app info");
+    puts("  --demo-push       send a demo weather push");
+    puts("  --export-csv      export stored packets to CSV");
+    puts("  --envoy-history   show recent Envoy/Enphase snapshots from the database");
+    puts("  --envoy-export-csv [file]  export Envoy/Enphase history to CSV");
+    puts("  --port N           override the listener port");
+    puts("  --db PATH          override the SQLite database path");
+    puts("  --envoy-host HOST  override the Envoy/Enphase host");
 }
 
 static int scan_ui_instance_running(int exclude_pid) {
@@ -395,8 +422,18 @@ typedef struct {
 
 typedef struct {
     char weather_ip[16];
+    char envoy_host[64];
+    char ecobee_api_key[128];
+    char ecobee_refresh_token[256];
+    char ecobee_api_base[128];
+    char envoy_debug[4096];
     time_t last_update;
     int messages_received;
+    EnphaseSnapshot envoy;
+    time_t envoy_last_update;
+    int envoy_poll_error;
+    EcobeeThermostatStatus ecobee_status[2];
+    int ecobee_status_count;
     char station_type[64];
     char tempf[32];
     char humidity[32];
@@ -426,6 +463,7 @@ typedef struct {
 typedef struct {
     DevicePushListener listener;
     PushStorage storage;
+    EnvoyDbStorage envoy_storage;
     int storage_error_reported;
     WeatherPushData weather;
     char recent_packets[RECENT_PACKET_ROWS][UI_LINE_LEN];
@@ -880,6 +918,118 @@ static int run_export_csv_mode(const AppConfig *cfg, const char *csv_path) {
     return 0;
 }
 
+static int run_envoy_history_mode(const AppConfig *cfg) {
+    const char *db_path = cfg && cfg->db_path[0] ? cfg->db_path : PUSH_DB_PATH;
+    EnvoyDbStorage storage;
+    char history[8192] = {0};
+    int row_count = 0;
+
+    memset(&storage, 0, sizeof(storage));
+    if (envoy_db_init(&storage, db_path) != 0) {
+        fprintf(stderr, "envoy history init failed: %s\n", storage.last_error[0] ? storage.last_error : "unknown");
+        return 1;
+    }
+
+    row_count = envoy_db_fetch_recent(&storage, 10, history, sizeof(history));
+    if (row_count < 0) {
+        fprintf(stderr, "envoy history query failed: %s\n", storage.last_error[0] ? storage.last_error : "unknown");
+        envoy_db_close(&storage);
+        return 1;
+    }
+
+    printf("Recent Envoy/Enphase snapshots from %s:\n", db_path);
+    if (row_count == 0) {
+        puts("- no snapshots stored yet");
+    } else {
+        puts(history);
+    }
+
+    envoy_db_close(&storage);
+    return 0;
+}
+
+static int run_envoy_export_csv_mode(const AppConfig *cfg, const char *csv_path) {
+    const char *db_path = cfg && cfg->db_path[0] ? cfg->db_path : PUSH_DB_PATH;
+    EnvoyDbStorage storage;
+    char history[65536] = {0};
+    int row_count = 0;
+
+    memset(&storage, 0, sizeof(storage));
+    if (envoy_db_init(&storage, db_path) != 0) {
+        fprintf(stderr, "envoy export init failed: %s\n", storage.last_error[0] ? storage.last_error : "unknown");
+        return 1;
+    }
+
+    row_count = envoy_db_fetch_recent(&storage, 10000, history, sizeof(history));
+    if (row_count < 0) {
+        fprintf(stderr, "envoy export query failed: %s\n", storage.last_error[0] ? storage.last_error : "unknown");
+        envoy_db_close(&storage);
+        return 1;
+    }
+
+    FILE *out = fopen(csv_path, "w");
+    if (!out) {
+        fprintf(stderr, "Failed to open %s: %s\n", csv_path, strerror(errno));
+        envoy_db_close(&storage);
+        return 1;
+    }
+
+    fprintf(out, "captured_at,production_watts,consumption_watts,storage_watts,today_wh,week_wh,month_wh,year_wh,lifetime_wh\n");
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT captured_at, production_watts, consumption_watts, storage_watts, today_wh, week_wh, month_wh, year_wh, lifetime_wh "
+        "FROM envoy_snapshots ORDER BY id;";
+    if (sqlite3_prepare_v2(storage.db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare Envoy export query: %s\n", sqlite3_errmsg(storage.db));
+        fclose(out);
+        envoy_db_close(&storage);
+        return 1;
+    }
+
+    int exported = 0;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        sqlite3_int64 captured_at = sqlite3_column_int64(stmt, 0);
+        double production = sqlite3_column_double(stmt, 1);
+        double consumption = sqlite3_column_double(stmt, 2);
+        double storage_w = sqlite3_column_double(stmt, 3);
+        double today = sqlite3_column_double(stmt, 4);
+        double week = sqlite3_column_double(stmt, 5);
+        double month = sqlite3_column_double(stmt, 6);
+        double year = sqlite3_column_double(stmt, 7);
+        double lifetime = sqlite3_column_double(stmt, 8);
+        fprintf(
+            out,
+            "%lld,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f\n",
+            (long long)captured_at,
+            production,
+            consumption,
+            storage_w,
+            today,
+            week,
+            month,
+            year,
+            lifetime
+        );
+        exported++;
+    }
+
+    sqlite3_finalize(stmt);
+    fclose(out);
+    envoy_db_close(&storage);
+
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "Failed during Envoy export: %s\n", sqlite3_errmsg(storage.db));
+        return 1;
+    }
+
+    printf("Exported %d Envoy snapshot rows to %s\n", exported, csv_path);
+    (void)history;
+    (void)row_count;
+    return 0;
+}
+
 static int push_storage_init(PushStorage *storage, const char *db_path) {
     memset(storage, 0, sizeof(*storage));
     snprintf(storage->path, sizeof(storage->path), "%s", db_path);
@@ -1212,7 +1362,7 @@ static int weather_push_parser(const DevicePushMessage *msg, void *user_data) {
     return 0;
 }
 
-static void push_ingest_reset(PushIngestState *state, const char *weather_ip, int listener_port) {
+static void push_ingest_reset(PushIngestState *state, const char *weather_ip, const char *envoy_host, int listener_port) {
     device_push_listener_stop(&state->listener);
     memset(&state->weather, 0, sizeof(state->weather));
     state->line_count = 0;
@@ -1223,8 +1373,18 @@ static void push_ingest_reset(PushIngestState *state, const char *weather_ip, in
     if (weather_ip && weather_ip[0] != '\0') {
         snprintf(state->weather.weather_ip, sizeof(state->weather.weather_ip), "%s", weather_ip);
     }
+    const char *effective_envoy_host = envoy_host && envoy_host[0] ? envoy_host : "192.168.1.17";
+    snprintf(state->weather.envoy_host, sizeof(state->weather.envoy_host), "%s", effective_envoy_host);
     state->recent_packet_count = 0;
     state->listener_port = listener_port;
+    if (!state->envoy_storage.db && state->storage.path[0]) {
+        if (envoy_db_init(&state->envoy_storage, state->storage.path) != 0) {
+            char line[UI_LINE_LEN];
+            snprintf(line, sizeof(line), "Envoy DB init failed: %s", state->envoy_storage.last_error[0] ? state->envoy_storage.last_error : "unknown");
+            ingest_append_line(state, line);
+            fprintf(stderr, "[scan-ui] %s\n", line);
+        }
+    }
     ingest_append_line(state, "Weather push listener");
     if (state->storage.db) {
         char storage_line[UI_LINE_LEN];
@@ -1261,6 +1421,10 @@ static void push_ingest_reset(PushIngestState *state, const char *weather_ip, in
     ingest_append_line(state, line);
 }
 
+static int enphase_fetch_snapshot(const char *host, EnphaseSnapshot *snapshot, char *debug_buffer, size_t debug_buffer_len);
+static void push_ingest_poll_envoy(PushIngestState *state);
+static void push_ingest_poll_ecobee(PushIngestState *state);
+
 static void push_ingest_poll(PushIngestState *state) {
     int handled = 0;
     if (state->listener.server_fd < 0) {
@@ -1282,12 +1446,190 @@ static void push_ingest_poll(PushIngestState *state) {
         }
     }
 
+    if (state->weather.envoy_host[0]) {
+        push_ingest_poll_envoy(state);
+    }
+    push_ingest_poll_ecobee(state);
+
     (void)handled;
 }
 
 static void push_ingest_stop(PushIngestState *state) {
     device_push_listener_stop(&state->listener);
     push_storage_close(&state->storage);
+    envoy_db_close(&state->envoy_storage);
+}
+
+static void push_ingest_poll_ecobee(PushIngestState *state) {
+    (void)state;
+    return;
+}
+
+static int snapshot_has_energy_values(const EnphaseSnapshot *snapshot) {
+    if (!snapshot) {
+        return 0;
+    }
+    return snapshot->today_wh > 0.0 || snapshot->week_wh > 0.0 || snapshot->month_wh > 0.0 || snapshot->year_wh > 0.0 || snapshot->lifetime_wh > 0.0;
+}
+
+static int should_poll_envoy(const PushIngestState *state, time_t now) {
+    if (!state || !state->weather.envoy_host[0]) {
+        return 0;
+    }
+    if (state->weather.envoy_last_update <= 0) {
+        return 1;
+    }
+    return (now - state->weather.envoy_last_update) >= ENVOY_POLL_INTERVAL_SEC;
+}
+
+static void push_ingest_poll_envoy(PushIngestState *state) {
+    if (!state || !state->weather.envoy_host[0]) {
+        return;
+    }
+
+    time_t now = time(NULL);
+    if (!should_poll_envoy(state, now)) {
+        return;
+    }
+
+    EnphaseSnapshot snapshot;
+    state->weather.envoy_debug[0] = '\0';
+    if (enphase_fetch_snapshot(state->weather.envoy_host, &snapshot, state->weather.envoy_debug, sizeof(state->weather.envoy_debug)) == 0) {
+        state->weather.envoy = snapshot;
+        state->weather.envoy_last_update = now;
+        state->weather.envoy_poll_error = 0;
+        if (state->envoy_storage.db) {
+            if (envoy_db_insert_snapshot(&state->envoy_storage, &snapshot, state->weather.envoy_last_update, state->weather.envoy_host, state->weather.envoy_debug) != 0) {
+                char line[UI_LINE_LEN];
+                snprintf(line, sizeof(line), "Envoy DB insert failed: %s", state->envoy_storage.last_error[0] ? state->envoy_storage.last_error : "unknown");
+                ingest_append_line(state, line);
+                fprintf(stderr, "[scan-ui] %s\n", line);
+            }
+        }
+    } else {
+        state->weather.envoy_poll_error = 1;
+    }
+}
+
+static int enphase_fetch_snapshot(const char *host, EnphaseSnapshot *snapshot, char *debug_buffer, size_t debug_buffer_len) {
+    static const char *paths[] = {
+        "/production?locale=en",
+        "/production",
+        "/home?locale=en",
+        "/home",
+        "/",
+        "/production.json",
+        "/api/production",
+        "/api/production.json"
+    };
+
+    char response[65536] = {0};
+    char last_body[65536] = {0};
+    int saw_any_response = 0;
+    EnphaseSnapshot fallback_snapshot;
+    memset(&fallback_snapshot, 0, sizeof(fallback_snapshot));
+    int saw_fallback = 0;
+
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            continue;
+        }
+
+        struct timeval timeout;
+        timeout.tv_sec = 2;
+        timeout.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(80);
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            close(sock);
+            break;
+        }
+
+        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            close(sock);
+            continue;
+        }
+
+        char req[512];
+        int req_len = snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Scan/1.0\r\nConnection: close\r\n\r\n", paths[i], host);
+        if (req_len < 0 || req_len >= (int)sizeof(req)) {
+            close(sock);
+            continue;
+        }
+        if (send(sock, req, (size_t)req_len, 0) < 0) {
+            close(sock);
+            continue;
+        }
+
+        memset(response, 0, sizeof(response));
+        size_t total = 0;
+        while (total < sizeof(response) - 1) {
+            ssize_t received = recv(sock, response + total, (int)(sizeof(response) - 1 - total), 0);
+            if (received <= 0) {
+                break;
+            }
+            total += (size_t)received;
+        }
+        close(sock);
+
+        if (total == 0) {
+            continue;
+        }
+        saw_any_response = 1;
+
+        char *body = strstr(response, "\r\n\r\n");
+        if (!body) {
+            body = response;
+        } else {
+            body += 4;
+        }
+
+        size_t body_len = strlen(body);
+        if (body_len > sizeof(last_body) - 1) {
+            body_len = sizeof(last_body) - 1;
+        }
+        memcpy(last_body, body, body_len);
+        last_body[body_len] = '\0';
+
+        if (debug_buffer && debug_buffer_len > 0) {
+            size_t copy_len = body_len > debug_buffer_len - 1 ? debug_buffer_len - 1 : body_len;
+            memcpy(debug_buffer, body, copy_len);
+            debug_buffer[copy_len] = '\0';
+        }
+
+        EnphaseSnapshot candidate;
+        memset(&candidate, 0, sizeof(candidate));
+        if (enphase_parse_snapshot(body, &candidate) == 0 && candidate.has_data) {
+            if (snapshot_has_energy_values(&candidate)) {
+                *snapshot = candidate;
+                fprintf(stderr, "[envoy] parsed response from %s\n", paths[i]);
+                return 0;
+            }
+            if (!saw_fallback || !snapshot_has_energy_values(&fallback_snapshot)) {
+                fallback_snapshot = candidate;
+                saw_fallback = 1;
+            }
+        }
+    }
+
+    if (saw_fallback) {
+        *snapshot = fallback_snapshot;
+        return 0;
+    }
+
+    if (saw_any_response && debug_buffer && debug_buffer_len > 0) {
+        size_t copy_len = strlen(last_body) > debug_buffer_len - 1 ? debug_buffer_len - 1 : strlen(last_body);
+        memcpy(debug_buffer, last_body, copy_len);
+        debug_buffer[copy_len] = '\0';
+    }
+
+    return -1;
 }
 
 static int build_weather_detail_lines(const PushIngestState *state, char lines[][UI_LINE_LEN], int max_lines) {
@@ -1314,6 +1656,17 @@ static int build_weather_detail_lines(const PushIngestState *state, char lines[]
     count = append_line(lines, max_lines, count, "UV: %s | Solar: %s W/m²",
         state->weather.uv[0] ? state->weather.uv : "n/a",
         state->weather.solarradiation[0] ? state->weather.solarradiation : "n/a");
+    if (state->weather.envoy.has_data) {
+        count = append_line(lines, max_lines, count, "Envoy: production=%.0fW consumption=%.0fW storage=%.0fW today=%.0fWh week=%.0fWh lifetime=%.0fWh",
+            state->weather.envoy.production_watts,
+            state->weather.envoy.consumption_watts,
+            state->weather.envoy.storage_watts,
+            state->weather.envoy.today_wh,
+            state->weather.envoy.week_wh,
+            state->weather.envoy.lifetime_wh);
+    } else if (state->weather.envoy_poll_error) {
+        count = append_line(lines, max_lines, count, "Envoy: poll failed");
+    }
     count = append_line(lines, max_lines, count, "Indoor: %s°F / %s%%",
         state->weather.indoortempf[0] ? state->weather.indoortempf : "n/a",
         state->weather.indoorhumidity[0] ? state->weather.indoorhumidity : "n/a");
@@ -1340,6 +1693,100 @@ static int build_weather_detail_lines(const PushIngestState *state, char lines[]
     }
 
     return count;
+}
+
+static void render_enphase_window(
+    SDL_Renderer *renderer,
+    TTF_Font *font,
+    const PushIngestState *state
+) {
+    int win_w = 0;
+    int win_h = 0;
+    SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
+
+    SDL_Color bg = {8, 18, 30, 255};
+    SDL_Color panel = {18, 28, 44, 255};
+    SDL_Color accent = {124, 183, 255, 255};
+    SDL_Color text = {230, 239, 255, 255};
+    SDL_Color muted = {175, 187, 205, 255};
+
+    SDL_SetRenderDrawColor(renderer, bg.r, bg.g, bg.b, bg.a);
+    SDL_RenderClear(renderer);
+
+    SDL_Rect outer = {8, 8, win_w - 16, win_h - 16};
+    SDL_SetRenderDrawColor(renderer, panel.r, panel.g, panel.b, panel.a);
+    SDL_RenderFillRect(renderer, &outer);
+    SDL_SetRenderDrawColor(renderer, accent.r, accent.g, accent.b, accent.a);
+    SDL_RenderDrawRect(renderer, &outer);
+
+    SDL_Rect title_bar = {16, 16, win_w - 32, 34};
+    SDL_SetRenderDrawColor(renderer, 28, 42, 64, 255);
+    SDL_RenderFillRect(renderer, &title_bar);
+
+#ifdef SCAN_HAS_SDL_TTF
+    if (font) {
+        int line_h = UI_FONT_SIZE + 4;
+        int y = 58;
+        draw_text_line(renderer, font, 24, y, "Enphase / Envoy Data", accent);
+        y += line_h;
+        draw_text_line(renderer, font, 24, y, "Live production and storage values", muted);
+        y += line_h + 6;
+
+        if (state->weather.envoy.has_data) {
+            draw_text_line(renderer, font, 24, y, "Status: connected", text);
+            y += line_h;
+            char line[UI_LINE_LEN];
+            snprintf(line, sizeof(line), "Production: %.0f W", state->weather.envoy.production_watts);
+            draw_text_line(renderer, font, 24, y, line, text);
+            y += line_h;
+            snprintf(line, sizeof(line), "Consumption: %.0f W", state->weather.envoy.consumption_watts);
+            draw_text_line(renderer, font, 24, y, line, text);
+            y += line_h;
+            snprintf(line, sizeof(line), "Storage: %.0f W", state->weather.envoy.storage_watts);
+            draw_text_line(renderer, font, 24, y, line, text);
+            y += line_h;
+            snprintf(line, sizeof(line), "Today: %.0f Wh", state->weather.envoy.today_wh);
+            draw_text_line(renderer, font, 24, y, line, text);
+            y += line_h;
+            snprintf(line, sizeof(line), "Week: %.0f Wh", state->weather.envoy.week_wh);
+            draw_text_line(renderer, font, 24, y, line, text);
+            y += line_h;
+            snprintf(line, sizeof(line), "Lifetime: %.0f Wh", state->weather.envoy.lifetime_wh);
+            draw_text_line(renderer, font, 24, y, line, text);
+            y += line_h + 4;
+            if (state->weather.envoy_last_update > 0) {
+                char ts[32] = "";
+                struct tm tm_snapshot;
+                localtime_r(&state->weather.envoy_last_update, &tm_snapshot);
+                strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_snapshot);
+                snprintf(line, sizeof(line), "Last update: %s", ts);
+                draw_text_line(renderer, font, 24, y, line, muted);
+                y += line_h;
+            }
+            if (state->weather.envoy_debug[0]) {
+                draw_text_line(renderer, font, 24, y, "Raw response:", muted);
+                y += line_h;
+                char debug_line[UI_LINE_LEN];
+                size_t debug_len = strlen(state->weather.envoy_debug);
+                if (debug_len > sizeof(debug_line) - 1) {
+                    debug_len = sizeof(debug_line) - 1;
+                }
+                memcpy(debug_line, state->weather.envoy_debug, debug_len);
+                debug_line[debug_len] = '\0';
+                draw_text_line(renderer, font, 24, y, debug_line, muted);
+            }
+        } else if (state->weather.envoy_poll_error) {
+            draw_text_line(renderer, font, 24, y, "Status: poll failed", text);
+            y += line_h;
+            draw_text_line(renderer, font, 24, y, "No fresh Enphase data is available yet.", muted);
+        } else {
+            draw_text_line(renderer, font, 24, y, "Status: waiting for first poll", text);
+            y += line_h;
+            draw_text_line(renderer, font, 24, y, "The Envoy data window will populate once the poll succeeds.", muted);
+        }
+
+    }
+#endif
 }
 
 static void render_weather_detail_window(
@@ -1460,6 +1907,27 @@ static int draw_weather_summary(
     draw_text_line(renderer, font, traffic_panel->x + 10, y, line, color);
     y += line_h;
     lines_used++;
+
+    if (state->weather.envoy.has_data) {
+        snprintf(line, sizeof(line), "Envoy: production=%.0fW | consumption=%.0fW | storage=%.0fW",
+            state->weather.envoy.production_watts,
+            state->weather.envoy.consumption_watts,
+            state->weather.envoy.storage_watts);
+        draw_text_line(renderer, font, traffic_panel->x + 10, y, line, color);
+        y += line_h;
+        lines_used++;
+
+        snprintf(line, sizeof(line), "Envoy today/lifetime: %.0fWh / %.0fWh",
+            state->weather.envoy.today_wh,
+            state->weather.envoy.lifetime_wh);
+        draw_text_line(renderer, font, traffic_panel->x + 10, y, line, color);
+        y += line_h;
+        lines_used++;
+    } else if (state->weather.envoy_poll_error) {
+        draw_text_line(renderer, font, traffic_panel->x + 10, y, "Envoy: poll failed", color);
+        y += line_h;
+        lines_used++;
+    }
 
     draw_text_line(renderer, font, traffic_panel->x + 10, y, "Recent packets:", color);
     y += line_h;
@@ -1838,7 +2306,7 @@ static int run_demo_push_mode(const AppConfig *cfg) {
         return 1;
     }
 
-    push_ingest_reset(&ingest, "127.0.0.1", listener_port);
+    push_ingest_reset(&ingest, "127.0.0.1", cfg && cfg->has_envoy_host_override ? cfg->envoy_host : NULL, listener_port);
 
     if (send_demo_push_payload("127.0.0.1", listener_port, payload) != 0) {
         fprintf(stderr, "[scan-ui] failed to send demo payload\n");
@@ -1917,6 +2385,7 @@ static int run_ui_mode(const AppConfig *cfg) {
     );
     SDL_Renderer *weather_renderer = NULL;
     if (weather_window) {
+        SDL_SetWindowPosition(weather_window, 120, 80);
         weather_renderer = SDL_CreateRenderer(weather_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
         if (!weather_renderer) {
             weather_renderer = SDL_CreateRenderer(weather_window, -1, SDL_RENDERER_ACCELERATED);
@@ -1925,6 +2394,28 @@ static int run_ui_mode(const AppConfig *cfg) {
             fprintf(stderr, "SDL_CreateRenderer for weather window failed: %s\n", SDL_GetError());
             SDL_DestroyWindow(weather_window);
             weather_window = NULL;
+        }
+    }
+
+    SDL_Window *enphase_window = SDL_CreateWindow(
+        "Enphase / Envoy Data",
+        SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED,
+        700,
+        480,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
+    );
+    SDL_Renderer *enphase_renderer = NULL;
+    if (enphase_window) {
+        SDL_SetWindowPosition(enphase_window, 1040, 120);
+        enphase_renderer = SDL_CreateRenderer(enphase_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        if (!enphase_renderer) {
+            enphase_renderer = SDL_CreateRenderer(enphase_window, -1, SDL_RENDERER_ACCELERATED);
+        }
+        if (!enphase_renderer) {
+            fprintf(stderr, "SDL_CreateRenderer for Enphase window failed: %s\n", SDL_GetError());
+            SDL_DestroyWindow(enphase_window);
+            enphase_window = NULL;
         }
     }
 
@@ -1972,8 +2463,11 @@ static int run_ui_mode(const AppConfig *cfg) {
         listener_port = cfg ? cfg->listener_port : PUSH_LISTENER_PORT;
         fprintf(stderr, "[scan-ui] failed to find a free listener port, using %d\n", listener_port);
     }
-    push_ingest_reset(&ingest, result.weather_station_ip, listener_port);
+    push_ingest_reset(&ingest, result.weather_station_ip, cfg && cfg->has_envoy_host_override ? cfg->envoy_host : NULL, listener_port);
+    push_ingest_poll_envoy(&ingest);
     float push_poll_accum = 0.0f;
+    float envoy_poll_accum = 0.0f;
+    float ecobee_poll_accum = 0.0f;
 #ifndef SCAN_HAS_SDL_TTF
     (void)lines;
     (void)line_count;
@@ -2070,7 +2564,7 @@ static int run_ui_mode(const AppConfig *cfg) {
                 line_count = build_ui_lines(&result, scan_ok, scan_err, scan_in_progress, lines, UI_MAX_LINES);
                 scroll_offset = 0;
                 traffic_scroll_offset = 0;
-                push_ingest_reset(&ingest, result.weather_station_ip, ingest.listener_port);
+                push_ingest_reset(&ingest, result.weather_station_ip, cfg && cfg->has_envoy_host_override ? cfg->envoy_host : NULL, ingest.listener_port);
                 push_poll_accum = 0.0f;
             } else if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                 win_w = ev.window.data1;
@@ -2104,9 +2598,19 @@ static int run_ui_mode(const AppConfig *cfg) {
         }
 
         push_poll_accum += dt;
+        envoy_poll_accum += dt;
         if (push_poll_accum >= PUSH_POLL_INTERVAL_SEC) {
             push_ingest_poll(&ingest);
             push_poll_accum = 0.0f;
+        }
+        if (envoy_poll_accum >= ENVOY_POLL_INTERVAL_SEC) {
+            push_ingest_poll_envoy(&ingest);
+            envoy_poll_accum = 0.0f;
+        }
+        ecobee_poll_accum += dt;
+        if (ecobee_poll_accum >= PUSH_POLL_INTERVAL_SEC) {
+            push_ingest_poll_ecobee(&ingest);
+            ecobee_poll_accum = 0.0f;
         }
 
         SDL_SetRenderDrawColor(renderer, 14, 22, 34, 255);
@@ -2265,6 +2769,10 @@ static int run_ui_mode(const AppConfig *cfg) {
             render_weather_detail_window(weather_renderer, font, &ingest);
             SDL_RenderPresent(weather_renderer);
         }
+        if (enphase_renderer) {
+            render_enphase_window(enphase_renderer, font, &ingest);
+            SDL_RenderPresent(enphase_renderer);
+        }
     }
 
     fprintf(stderr, "[scan-ui] exit: %s\n", quit_reason);
@@ -2282,6 +2790,12 @@ static int run_ui_mode(const AppConfig *cfg) {
     }
     if (weather_window) {
         SDL_DestroyWindow(weather_window);
+    }
+    if (enphase_renderer) {
+        SDL_DestroyRenderer(enphase_renderer);
+    }
+    if (enphase_window) {
+        SDL_DestroyWindow(enphase_window);
     }
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
@@ -2329,6 +2843,10 @@ int main(int argc, char **argv) {
         rc = run_info_mode();
     } else if (cfg.export_csv_mode) {
         rc = run_export_csv_mode(&cfg, cfg.export_csv_path);
+    } else if (cfg.envoy_history_mode) {
+        rc = run_envoy_history_mode(&cfg);
+    } else if (cfg.envoy_export_csv_mode) {
+        rc = run_envoy_export_csv_mode(&cfg, cfg.envoy_history_csv_path ? cfg.envoy_history_csv_path : "envoy_history.csv");
     } else if (cfg.ui_mode) {
         rc = run_ui_mode(&cfg);
     } else if (cfg.demo_push_mode) {
